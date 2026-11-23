@@ -1,10 +1,10 @@
-# Builds Vellum for every desktop on each push to main, which also keeps the build caches
-# warm. For a version tag (v0.1.0) it publishes a GitHub Release with the archives attached.
+# Builds Vellum for every desktop. For a version tag (v0.1.0) it publishes a GitHub Release
+# with the archives attached. Run it by hand on main to try the builds, which also refreshes
+# the build caches the next release starts from.
 name: Release
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -54,7 +54,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Compiled Rust dependencies, saved from main only so tag builds don't store copies.
+      # Compiled Rust dependencies, saved from main only: a cache saved by a tag build is
+      # visible to that tag alone.
       # Windows keys on the runner image too: its C++ toolset changes with it, and objects
       # built by a newer toolset don't link with an older one.
       - uses: Swatinem/rust-cache@v2
@@ -163,7 +164,7 @@ jobs:
           done
           rm -rf "$prefix/build"
       - name: Save the speech engine
-        if: steps.engine.outputs.cache-hit != 'true'
+        if: steps.engine.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: .native/transcribe
