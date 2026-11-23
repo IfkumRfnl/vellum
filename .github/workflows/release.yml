@@ -121,8 +121,15 @@ jobs:
           dir="dist/$ARCHIVE"
           mkdir -p "$dir"
           cp target/release/vellum LICENSE "$dir/"
-          cp -a target/release/vellum-libs "$dir/"
+          libs="$(find target -type d -name vellum-libs -print -quit)"
+          if [ -z "$libs" ]; then
+            ls -la target/release
+            find target/release/build -maxdepth 3 -path '*transcribe*' -name '*.so*' | head
+            echo "::error::the build staged no vellum-libs directory"; exit 1
+          fi
+          cp -a "$libs" "$dir/"
           find target/release -maxdepth 1 -name '*.so*' -exec cp -a {} "$dir/" \;
+          ls -la "$dir" "$dir/vellum-libs"
           tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
 
       - name: Package for macOS
