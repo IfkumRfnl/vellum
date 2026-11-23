@@ -16,7 +16,7 @@
 Vellum is a native desktop app written in Rust with [Rune](https://github.com/anomalyco/rune). It reads a video's captions, or downloads its audio and transcribes it locally with Parakeet or Whisper, optionally labelling speakers.
 
 - **Local speech recognition.** Parakeet Unified English, Whisper Small and Whisper Large v3 Turbo through [transcribe.cpp](https://crates.io/crates/transcribe-cpp), on Vulkan, Metal or the CPU. No Python, nothing uploaded.
-- **Speaker labels** from sherpa-onnx's pyannote segmentation and TitaNet embeddings.
+- **Speaker labels.** Vellum can tell voices apart and label each speaker's turns.
 - **One progress indicator.** A plate of dots fills as the transcript is made, with the percentage, the time left and the words as they're recognized.
 - **Reading progress.** A hairline along the top fills as you read, and the toolbar shows how far you are and the time left at your reading pace, which Vellum learns from how you scroll and remembers.
 - **Made for reading.** One continuous page; serif, sans or mono; adjustable size, width and spacing; timestamps open the video at that moment.
@@ -58,42 +58,15 @@ In the reader, **Aa** changes the typeface, size, reading width, line spacing an
 | Ctrl + mouse wheel | Text size |
 | Esc | Cancel a transcription, or close **Aa** |
 
-Speech recognition picks the GPU automatically and falls back to the CPU on a device error, keeping the work already done. Set `TRANSCRIBE_BACKENDS=cpu` to force the CPU. Speaker analysis always runs on the CPU. Audio is temporary. Model weights are checked against their SHA-256 digests and kept in the Hugging Face cache (`HF_HOME`, `HF_HUB_CACHE`). Settings live in your platform's config directory, or in `VELLUM_CONFIG_DIR` if set.
-
-## How it's built
-
-```
-src/
-├── main.rs          Window setup
-├── app.rs           State, screens, actions and the per-frame poll
-├── settings.rs      Preferences and their background writer
-├── document.rs      A transcript, word counts, time formats
-├── pipeline.rs      Worker updates, and the Tracker behind the progress indicator
-├── reading.rs       Reading progress and your measured pace
-├── job.rs           Worker threads, cancellation, tool processes
-├── scenes.rs        Demo states for headless screenshots
-├── media/           YouTube, speech recognition, speaker labels, model downloads
-└── ui/              Theme, widgets, home, model picker, progress screen, reader,
-                     and fx/ (the compositor that draws the progress dots)
-```
-
-The worker reports updates (stage, fraction, recognized speech, device) over a channel. `pipeline::Tracker` folds them into one smoothed fraction that only moves forward: it glides between sparse reports and estimates the steps that report nothing. The dots are an `El::effect` slot drawn by `ui/fx/dots.wgsl`. Scrolling the reader never re-runs the view; the scroll handler writes Rune live values.
+Speech recognition uses your GPU when it can and falls back to the CPU otherwise; set `TRANSCRIBE_BACKENDS=cpu` to always use the CPU. Downloaded audio is deleted once the transcript is ready. Models are kept in the Hugging Face cache, so other apps that use it can share them.
 
 ## Development
 
 ```sh
-cargo test --locked                                      # offline: logic and UI
-cargo test --release --locked -- --include-ignored --test-threads=1 --nocapture   # plus live videos
+cargo test --locked
 ```
 
-The live suite downloads public videos and compares full local transcriptions with the publisher's captions. See [the test cases and acceptance criteria](tests/README.md).
-
-Debug builds include Rune's headless tooling, so you can render any screen without a window:
-
-```sh
-cargo run -- --scene working --snap working.png --at 2      # also: home, finished, reader
-cargo run -- --scene demo --realtime --video demo.mp4 --duration 14
-```
+See [tests/README.md](tests/README.md) for the optional tests that transcribe real videos.
 
 ## License
 
