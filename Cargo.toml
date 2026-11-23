@@ -41,8 +41,12 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["metal"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(all(not(target_os = "macos"), not(all(windows, target_arch = "aarch64"))))'.dependencies]
 transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["vulkan", "dynamic-backends"] }
+
+# Windows on ARM transcribes on the CPU: there's no Vulkan SDK for it to build against.
+[target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
+transcribe-cpp = { version = "=0.4.2", default-features = false }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

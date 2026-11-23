@@ -1,4 +1,4 @@
-// Progress as a field of dots, in the manner of Hex's dot scope.
+// Progress as a field of dots.
 //
 // The plate is Rune's own rounded element; this draws the dots inside it. Unlit dots are a faint
 // grid that fades toward the top and bottom rows. Lit dots fill from the left, white, a little

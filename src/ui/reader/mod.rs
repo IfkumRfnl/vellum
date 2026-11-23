@@ -28,8 +28,24 @@ const FACES: [Family; 3] = [SERIF, Family::Sans, Family::SystemMono];
 const ARTICLE: &str = "article";
 
 pub fn toolbar(s: &State) -> El {
+    let copied = s.reader.copied_at.is_some();
     let actions = row()
         .gap(8.0)
+        .child(
+            button(
+                if copied { "Copied" } else { "Copy" },
+                Tone::Quiet,
+                |s, tx| {
+                    if let Some(doc) = &s.doc {
+                        tx.copy(doc.plain_text());
+                        s.reader.copied_at = Some(s.clock);
+                    }
+                },
+            )
+            .key("copy")
+            .label("Copy transcript")
+            .help("Copy the whole transcript"),
+        )
         .child(
             button(
                 "Aa",

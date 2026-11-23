@@ -1,5 +1,5 @@
-//! Vellum's look: black, white and greys. The progress dots add Hex's system orange for work in
-//! progress (`fx/dots.wgsl`), and green marks what's done.
+//! Vellum's look: black, white and greys. The progress dots add orange for work in progress
+//! (`fx/dots.wgsl`), and green marks what's done.
 
 use rune::{Color, TextStyle};
 
@@ -12,7 +12,7 @@ pub const MUTED: &str = "#a8a8a8";
 pub const FAINT: &str = "#6b6b6b";
 pub const ACCENT: &str = "#ffffff";
 pub const SELECTION: &str = "#555555";
-/// Finished (Hex's system green).
+/// Finished.
 pub const DONE: &str = "#30d158";
 
 pub fn c(hex: &str) -> Color {

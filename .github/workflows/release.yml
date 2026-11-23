@@ -1,0 +1,188 @@
+# Builds Vellum for every desktop and, for a version tag (v0.1.0), publishes a GitHub Release
+# with the archives attached. Run it by hand to test the builds without publishing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            label: windows-x64
+          - name: Windows ARM64
+            runner: windows-11-arm
+            label: windows-arm64
+          - name: Linux x64
+            runner: ubuntu-24.04
+            label: linux-x64
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            label: linux-arm64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            label: macos-arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            label: macos-x64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Name the release
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="${GITHUB_REF_NAME#v}"; else
+            version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "ARCHIVE=vellum-$version-${{ matrix.label }}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+          env-vars: INCLUDE LIB ImageVersion
+
+      # Windows x64 and Linux build the Vulkan speech backend.
+      - name: Install the Vulkan SDK
+        if: matrix.label == 'windows-x64'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+      - name: Install SPIRV-Headers
+        if: matrix.label == 'windows-x64'
+        shell: pwsh
+        run: |
+          vcpkg install spirv-headers:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install spirv-headers failed" }
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\','/'
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$prefix"
+
+      # ggml's ARM CPU backend won't build with MSVC: build the native core with clang-cl.
+      - name: Use clang-cl
+        if: matrix.label == 'windows-arm64'
+        shell: bash
+        run: |
+          {
+            echo "CC=clang-cl"
+            echo "CXX=clang-cl"
+            echo "CMAKE_C_COMPILER=clang-cl"
+            echo "CMAKE_CXX_COMPILER=clang-cl"
+            echo "CMAKE_C_COMPILER_TARGET=aarch64-pc-windows-msvc"
+            echo "CMAKE_CXX_COMPILER_TARGET=aarch64-pc-windows-msvc"
+            echo "CMAKE_GENERATOR=Ninja"
+            echo "CL=/EHsc"
+            echo "TRANSCRIBE_CMAKE_ARGS=-DGGML_NATIVE=OFF -DGGML_OPENMP=OFF"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake pkg-config libasound2-dev libssl-dev libgtk-3-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libfontconfig1-dev libfreetype-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libwayland-dev libvulkan-dev glslc libshaderc-dev
+
+      - name: Install the Metal toolchain
+        if: runner.os == 'macOS'
+        run: xcrun --sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "dist/$env:ARCHIVE"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/vellum.exe, target/release/*.dll, LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/$env:ARCHIVE.zip"
+
+      - name: Package for Linux
+        if: runner.os == 'Linux'
+        run: |
+          dir="dist/$ARCHIVE"
+          mkdir -p "$dir"
+          cp target/release/vellum LICENSE "$dir/"
+          cp -a target/release/vellum-libs "$dir/"
+          find target/release -maxdepth 1 -name '*.so*' -exec cp -a {} "$dir/" \;
+          tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
+
+      - name: Package for macOS
+        if: runner.os == 'macOS'
+        run: |
+          app="dist/Vellum.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/vellum "$app/Contents/MacOS/"
+          find target/release -maxdepth 1 -name '*.dylib' -exec cp -a {} "$app/Contents/MacOS/" \;
+          iconset="$RUNNER_TEMP/Vellum.iconset"
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            sips -z $size $size assets/app-icon.png --out "$iconset/icon_${size}x${size}.png" > /dev/null
+            sips -z $((size * 2)) $((size * 2)) assets/app-icon.png --out "$iconset/icon_${size}x${size}@2x.png" > /dev/null
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/Vellum.icns"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Vellum</string>
+            <key>CFBundleDisplayName</key><string>Vellum</string>
+            <key>CFBundleIdentifier</key><string>app.vellum.reader</string>
+            <key>CFBundleExecutable</key><string>vellum</string>
+            <key>CFBundleIconFile</key><string>Vellum</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep --sign - "$app"
+          cp LICENSE dist/
+          (cd dist && ditto -c -k --keepParent Vellum.app "$ARCHIVE.zip")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Vellum ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true

@@ -21,25 +21,26 @@ Vellum is a native desktop app written in Rust with [Rune](https://github.com/an
 - **Reading progress.** A hairline along the top fills as you read, and the toolbar shows how far you are and the time left at your reading pace, which Vellum learns from how you scroll and remembers.
 - **Made for reading.** One continuous page; serif, sans or mono; adjustable size, width and spacing; timestamps open the video at that moment.
 
-## Install and run
+## Install
 
-Vellum uses the standalone [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases) executable with Node.js 22+ or Deno for YouTube extraction, and FFmpeg for audio. It finds yt-dlp and FFmpeg beside its executable or on `PATH`. On macOS it also checks the Homebrew directories when launched from Finder.
+Download Vellum for your system from the [latest release](https://github.com/IfkumRfnl/vellum/releases/latest): Windows (x64, ARM64), macOS (Apple Silicon, Intel) or Linux (x64, ARM64). Unpack it and run `vellum`, or open `Vellum.app` on a Mac. The Mac app isn't notarized, so the first time, right-click it and choose **Open**.
 
-Building from source requires Rust 1.99.1 or newer, CMake and a C++ compiler:
+Vellum also needs [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases), with Node.js 22+ or Deno, and [FFmpeg](https://ffmpeg.org/download.html). It finds them beside its executable or on your `PATH`, and on a Mac in Homebrew's directories too.
 
-- **Windows:** Visual Studio C++ build tools and the Windows SDK.
-- **Windows and Linux:** Vulkan headers and shader tools, for the optional GPU backend.
-- **macOS:** Xcode with the Metal toolchain.
+### Build from source
+
+You need Rust 1.99.1 or newer, CMake and a C++ compiler: the Visual Studio C++ build tools on Windows, Xcode with the Metal toolchain on macOS. Windows x64 and Linux also need the Vulkan headers and shader tools for GPU speech recognition.
 
 ```sh
 cargo run --release --locked
 ```
 
-When you move a build, keep the native libraries with it: the DLLs beside `vellum.exe` on Windows, or the `vellum-libs/` directory beside `vellum` on Linux.
+Keep the native libraries with the executable when you move a build: the DLLs beside `vellum.exe` on Windows, the `.dylib`s beside `vellum` on macOS, or the `.so`s and the `vellum-libs/` directory beside `vellum` on Linux.
 
 | Desktop | Speech acceleration | Display |
 | --- | --- | --- |
-| Windows | Vulkan or CPU | Direct3D 12 |
+| Windows x64 | Vulkan or CPU | Direct3D 12 |
+| Windows ARM64 | CPU | Direct3D 12 |
 | Linux | Vulkan or CPU | A graphical session with a Vulkan driver, hardware or software |
 | macOS | Metal or CPU | A Metal-capable Mac |
 
@@ -49,7 +50,7 @@ On first launch, choose a speech model. Parakeet Unified English (731 MB) is the
 
 Paste a link and press **Transcribe**. When the video has its uploader's own captions, Vellum uses them, which takes seconds; otherwise it transcribes the audio with your speech model. The model button in the top right switches models or chooses YouTube captions, automatic ones included. **Label speakers** adds speaker turns.
 
-In the reader, **Aa** changes the typeface, size, reading width, line spacing and timestamps. The toolbar shows how far you are and how long is left at your reading pace.
+In the reader, **Copy** copies the whole transcript, and **Aa** changes the typeface, size, reading width, line spacing and timestamps. The toolbar shows how far you are and how long is left at your reading pace.
 
 | Keys | Action |
 | --- | --- |
@@ -67,6 +68,10 @@ cargo test --locked
 ```
 
 See [tests/README.md](tests/README.md) for the optional tests that transcribe real videos.
+
+## Credits
+
+Vellum stands on [Rune](https://github.com/anomalyco/rune) for its interface, [transcribe.cpp](https://crates.io/crates/transcribe-cpp) and [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) for speech and speaker recognition, NVIDIA's [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (CC-BY-4.0) and OpenAI's [Whisper](https://github.com/openai/whisper) (MIT) models, [pyannote](https://github.com/pyannote/pyannote-audio) segmentation and NVIDIA's TitaNet speaker embeddings, [yt-dlp](https://github.com/yt-dlp/yt-dlp), [FFmpeg](https://ffmpeg.org) and the [Inter](https://rsms.me/inter/) typeface.
 
 ## License
 

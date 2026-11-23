@@ -37,6 +37,18 @@ impl Document {
         self.paragraphs.iter().map(|p| word_count(&p.text)).sum()
     }
 
+    /// The whole transcript as plain text, each speaker's name on its own line before their turn.
+    pub fn plain_text(&self) -> String {
+        self.paragraphs
+            .iter()
+            .map(|p| match &p.speaker {
+                Some(speaker) => format!("{speaker}\n{}", p.text),
+                None => p.text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// The video at `seconds`, for a timestamp's link.
     pub fn link_at(&self, seconds: f64) -> Option<String> {
         (!self.link.is_empty()).then(|| format!("{}&t={}s", self.link, seconds.max(0.0) as u64))
@@ -94,6 +106,31 @@ mod tests {
         assert_eq!(word_count("I read the  wrong word."), 5);
         assert_eq!(word_count("你好世界"), 4);
         assert_eq!(word_count(""), 0);
+    }
+
+    #[test]
+    fn copies_speakers_on_their_own_lines() {
+        let doc = Document {
+            title: String::new(),
+            channel: String::new(),
+            link: String::new(),
+            source: String::new(),
+            language: String::new(),
+            speaker_note: String::new(),
+            paragraphs: vec![
+                Paragraph {
+                    start: 0.0,
+                    speaker: Some("Speaker 1".into()),
+                    text: "Hello.".into(),
+                },
+                Paragraph {
+                    start: 2.0,
+                    speaker: None,
+                    text: "Bye.".into(),
+                },
+            ],
+        };
+        assert_eq!(doc.plain_text(), "Speaker 1\nHello.\n\nBye.");
     }
 
     #[test]

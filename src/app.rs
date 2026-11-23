@@ -13,6 +13,8 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 /// How long the finished meter celebrates before the transcript opens.
 pub const CELEBRATION: f64 = 1.35;
+/// How long **Copy** says it copied.
+pub const COPIED: f64 = 1.5;
 
 pub enum Screen {
     Models,
@@ -39,6 +41,8 @@ pub struct ModelJob {
 /// The reader's own state, reset for each transcript.
 #[derive(Default)]
 pub struct ReaderState {
+    /// When the transcript was last copied, for the button's confirmation.
+    pub copied_at: Option<f64>,
     pub appearance: bool,
     pub wheel_remainder: f32,
     /// Shared with the scroll handler, which updates it on every frame of a scroll.
@@ -237,6 +241,7 @@ pub fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     changed |= poll_model(s);
     changed |= match &s.screen {
         Screen::Working(_) => poll_working(s, clock, dt, tx),
+        Screen::Reader => poll_reader(s, clock, tx),
         _ => false,
     };
     changed
@@ -306,4 +311,23 @@ fn poll_working(s: &mut State, clock: f64, dt: f64, tx: &mut Tx) -> bool {
     // The meter moves every frame while the job runs.
     tx.wake_after(Duration::from_millis(16));
     changed
+}
+
+fn poll_reader(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
+    let Some(at) = s.reader.copied_at else {
+        return false;
+    };
+    if clock - at >= COPIED {
+        s.reader.copied_at = None;
+        return true;
+    }
+    tx.wake_after(Duration::from_secs_f64(COPIED - (clock - at)));
+    false
+}
+
+impl Drop for State {
+    /// Keeps the reading pace measured in this session for the next one.
+    fn drop(&mut self) {
+        self.keep_reading_speed();
+    }
 }

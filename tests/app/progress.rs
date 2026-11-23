@@ -23,7 +23,7 @@ fn long_document() -> Document {
 }
 
 #[test]
-fn paging_moves_the_reading_progress() {
+fn paging_moves_the_reading_progress_and_copy_confirms() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = load_state(Some(dir.path().join("settings.json")));
     s.settings.configured = true;
@@ -53,6 +53,12 @@ fn paging_moves_the_reading_progress() {
     }
     assert!(rt.state.reading_fraction() > 0.99);
     assert!(rt.find("reading-status").is_some());
+    tap(&mut rt, "copy");
+    assert!(rt.state.reader.copied_at.is_some());
+    for _ in 0..40 {
+        rt.frame(0.05);
+    }
+    assert!(rt.state.reader.copied_at.is_none());
 }
 
 #[test]
