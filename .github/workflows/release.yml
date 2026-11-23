@@ -115,6 +115,8 @@ jobs:
           $dir = "dist/$env:ARCHIVE"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/vellum.exe, target/release/*.dll, LICENSE $dir
+          Get-ChildItem $dir | Format-Table Name, Length
+          if ($env:ARCHIVE -like '*x64' -and -not (Test-Path "$dir/transcribe.dll")) { throw "transcribe.dll is missing" }
           Compress-Archive -Path $dir -DestinationPath "dist/$env:ARCHIVE.zip"
 
       - name: Package for Linux
@@ -123,16 +125,10 @@ jobs:
           dir="dist/$ARCHIVE"
           mkdir -p "$dir"
           cp target/release/vellum LICENSE "$dir/"
-          libs="$(find target -type d -name vellum-libs -print -quit)"
-          if [ -z "$libs" ]; then
-            ls -la target/release
-            find target/release/build -maxdepth 3 -path '*transcribe*' -name '*.so*' | head
-            echo "::error::the build staged no vellum-libs directory"; exit 1
-          fi
-          echo "Speech libraries: $libs"
-          cp -a "$libs" "$dir/"
+          cp -a target/release/vellum-libs "$dir/"
           find target/release -maxdepth 1 -name '*.so*' -exec cp -a {} "$dir/" \;
           ls -la "$dir" "$dir/vellum-libs"
+          test -e "$dir/vellum-libs/libtranscribe.so" || { echo "::error::libtranscribe.so is missing"; exit 1; }
           tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
 
       - name: Package for macOS
