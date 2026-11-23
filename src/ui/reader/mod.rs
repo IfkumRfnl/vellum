@@ -94,11 +94,7 @@ pub fn view(s: &State, doc: &Document) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
-        .on_scroll_offset(
-            s.reader
-                .hud
-                .follow(&s.reader.progress, s.settings.reading_wpm),
-        )
+        .on_scroll_offset(s.reader.hud.follow(&s.reader.progress))
         .on_wheel(font_wheel)
         .child(
             col()

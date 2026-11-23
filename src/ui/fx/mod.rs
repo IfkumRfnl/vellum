@@ -1,5 +1,5 @@
 //! Vellum's compositor: Rune draws the window, and Vellum's dot shader (`dots.wgsl`) fills the
-//! effect slots that show progress.
+//! progress plate's effect slot.
 
 use crate::State;
 use rune::compose::{Compositor, DeviceKey, Frame};
@@ -8,13 +8,10 @@ use std::collections::HashMap;
 
 /// The progress plate's dots. Data: progress, finished at (−1: running).
 pub const PLATE: u32 = 1;
-/// The reader's strip of dots; its progress comes from the reader. Data: finished at.
-pub const STRIP: u32 = 2;
 
-/// Dot pitch on the plate and the strip, points.
-const PLATE_PITCH: f32 = 9.0;
-const PLATE_ROWS: f32 = 5.0;
-const STRIP_PITCH: f32 = 6.0;
+/// Dot pitch, points, and rows.
+const PITCH: f32 = 9.0;
+const ROWS: f32 = 5.0;
 
 /// What one draw needs, as the shader's `Dots` reads it.
 struct Dots {
@@ -158,7 +155,6 @@ impl Compositor<State> for Gfx {
         pipelines.add_format(device, wgpu::TextureFormat::Rgba16Float);
         let pipelines = &*pipelines;
         let clock = f.rt.clock;
-        let reading = f.rt.state.reading_fraction();
         let since = |at: f32| {
             if at >= 0.0 {
                 (clock - f64::from(at)) as f32
@@ -179,19 +175,14 @@ impl Compositor<State> for Gfx {
             f.target,
             clear,
             &mut |pass, s: &EffectSite<'_>| {
-                let dots = match s.mark & 0xff {
-                    PLATE => Dots::at(
-                        s,
-                        [clock as f32, s.data[0], since(s.data[1]), 0.0],
-                        [0.0, PLATE_PITCH, PLATE_ROWS, 1.0],
-                    ),
-                    STRIP => Dots::at(
-                        s,
-                        [clock as f32, reading, since(s.data[0]), 0.0],
-                        [1.0, STRIP_PITCH, 1.0, 1.0],
-                    ),
-                    _ => return,
-                };
+                if s.mark & 0xff != PLATE {
+                    return;
+                }
+                let dots = Dots::at(
+                    s,
+                    [clock as f32, s.data[0], since(s.data[1]), 0.0],
+                    [PITCH, ROWS, 1.0, 0.0],
+                );
                 pipelines.draw(pass, s.format, &dots);
             },
         );

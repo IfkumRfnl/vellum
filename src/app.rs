@@ -215,6 +215,7 @@ impl State {
     }
 
     /// How far through the transcript the reader is, 0 to 1.
+    #[cfg(test)]
     pub fn reading_fraction(&self) -> f32 {
         self.reader
             .progress

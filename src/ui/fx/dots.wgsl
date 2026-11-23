@@ -6,9 +6,6 @@
 // passes over the lit dots while the job runs. When it's done every dot turns green, then
 // settles back to white.
 //
-// The strip variant is the reader's: one row of dots, lit by how far you've read, green at the
-// end.
-//
 // Colours are sRGB-encoded and premultiplied.
 
 struct Dots {
@@ -18,7 +15,7 @@ struct Dots {
     pass_size: vec4f,
     // Seconds, progress 0 to 1, seconds since finishing (< 0: running).
     state: vec4f,
-    // 1 for the strip, dot pitch in points, rows, opacity.
+    // Dot pitch in points, rows, opacity.
     style: vec4f,
 }
 
@@ -70,9 +67,8 @@ fn dots_fragment(v: Varyings) -> @location(0) vec4f {
     let progress = clamp(u.state.y, 0.0, 1.0);
     let done_age = u.state.z;
     let done = done_age >= 0.0;
-    let strip = u.style.x > 0.5;
-    let pitch = u.style.y;
-    let rows = max(i32(u.style.z + 0.5), 1);
+    let pitch = u.style.x;
+    let rows = max(i32(u.style.y + 0.5), 1);
     let size = u.rect.zw / u.pass_size.z;
     let aa = 0.8 / u.pass_size.z;
 
@@ -94,7 +90,7 @@ fn dots_fragment(v: Varyings) -> @location(0) vec4f {
     let lit = select(clamp(front - column, 0.0, 1.0), 1.0, done);
     // Columns just behind the front are live.
     let behind = front - column - 1.0;
-    let live = select(exp(-max(behind, 0.0) * 0.55) * sstep(0.0, 0.6, lit), 0.0, done || strip);
+    let live = select(exp(-max(behind, 0.0) * 0.55) * sstep(0.0, 0.6, lit), 0.0, done);
 
     // Each live dot flickers on its own.
     let seed = hash(vec2f(column, f32(j)));
@@ -102,31 +98,28 @@ fn dots_fragment(v: Varyings) -> @location(0) vec4f {
 
     // A slow beam passing over what's done.
     let beam_at = fract(t / 2.6) * (f32(columns) + 16.0) - 8.0;
-    let beam = select(exp(-pow((column - beam_at) / 3.0, 2.0)) * 0.35, 0.0, done || strip);
+    let beam = select(exp(-pow((column - beam_at) / 3.0, 2.0)) * 0.35, 0.0, done);
 
-    var row_fade = 1.0;
-    if (rows > 1) {
-        let row = abs(f32(j) + 0.5 - f32(rows) * 0.5) / (f32(rows) * 0.5);
-        row_fade = 1.0 - 0.7 * sstep(0.35, 0.95, row);
-    }
-    let unlit = select(0.10, 0.22, strip) * row_fade;
+    let row = abs(f32(j) + 0.5 - f32(rows) * 0.5) / (f32(rows) * 0.5);
+    let row_fade = 1.0 - 0.7 * sstep(0.35, 0.95, row);
+    let unlit = 0.10 * row_fade;
     let power = lit * mix(0.82, 1.0, row_fade) * mix(1.0, flicker, live);
     let alpha = mix(unlit, 0.96, power) + beam * lit;
     let radius = pitch * mix(0.22, 0.34, power);
 
     var color = mix(WHITE, ORANGE, live);
     if (done) {
-        // Green on finishing, settling back to white; the strip stays green.
-        let green = select(exp(-max(done_age - 0.25, 0.0) * 1.6), 1.0, strip);
+        // Green on finishing, settling back to white.
+        let green = exp(-max(done_age - 0.25, 0.0) * 1.6);
         // A sweep of light across the field as it turns.
         let sweep = exp(-pow(column - done_age * f32(columns) * 1.8, 2.0) / 6.0);
         color = mix(WHITE, GREEN, clamp(green, 0.0, 1.0));
-        color = mix(color, vec3f(1.0), sweep * 0.6 * select(1.0, 0.0, strip));
+        color = mix(color, vec3f(1.0), sweep * 0.6);
     }
 
     var acc = vec4f(0.0);
     over(&acc, color, clamp(alpha, 0.0, 1.0) * sstep(aa, -aa, distance - radius));
-    var result = acc * u.style.w;
+    var result = acc * u.style.z;
     if (u.pass_size.w < 0.5) {
         result = vec4f(pow(max(result.rgb, vec3f(0.0)), vec3f(2.2)), result.a);
     }

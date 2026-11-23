@@ -20,7 +20,7 @@ pub fn view(s: &State) -> El {
         .min_w(0.0)
         .on_edit(|s: &mut State| &mut s.input)
         .on_submit(|s: &mut State, _| s.start());
-    let mut content = col().gap(18.0).child(heading("Open a video")).child(
+    let mut content = col().gap(18.0).child(heading("Read a video")).child(
         row()
             .h(61.0)
             .w_full()

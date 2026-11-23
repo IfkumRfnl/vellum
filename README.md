@@ -18,7 +18,7 @@ Vellum is a native desktop app written in Rust with [Rune](https://github.com/an
 - **Local speech recognition.** Parakeet Unified English, Whisper Small and Whisper Large v3 Turbo through [transcribe.cpp](https://crates.io/crates/transcribe-cpp), on Vulkan, Metal or the CPU. No Python, nothing uploaded.
 - **Speaker labels** from sherpa-onnx's pyannote segmentation and TitaNet embeddings.
 - **One progress indicator.** A plate of dots fills as the transcript is made, with the percentage, the time left and the words as they're recognized.
-- **Reading progress.** A hairline along the top and a small pill show how far you are and how long is left. Vellum learns your reading pace from how you scroll and remembers it.
+- **Reading progress.** A hairline along the top and a small pill show how far you are, how long is left and your reading pace, which Vellum learns from how you scroll and remembers.
 - **Made for reading.** One continuous page; serif, sans or mono; adjustable size, width and spacing; timestamps open the video at that moment; corrections in place.
 
 ## Install and run
