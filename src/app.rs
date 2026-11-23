@@ -13,6 +13,8 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 /// How long the finished meter celebrates before the transcript opens.
 pub const CELEBRATION: f64 = 1.35;
+/// How long **Copy transcript** says it copied.
+pub const COPIED: f64 = 1.6;
 
 pub enum Screen {
     Models,
@@ -46,6 +48,8 @@ pub struct ReaderState {
     pub progress: Rc<RefCell<Option<Reading>>>,
     pub hud: crate::ui::reader::Hud,
     pub finished_at: Option<f64>,
+    /// When the transcript was last copied, for the button's confirmation.
+    pub copied_at: Option<f64>,
 }
 
 pub struct State {
@@ -344,6 +348,13 @@ fn poll_working(s: &mut State, clock: f64, dt: f64, tx: &mut Tx) -> bool {
 }
 
 fn poll_reader(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
+    if let Some(at) = s.reader.copied_at {
+        if clock - at >= COPIED {
+            s.reader.copied_at = None;
+            return true;
+        }
+        tx.wake_after(Duration::from_secs_f64(COPIED - (clock - at)));
+    }
     let finished = s
         .reader
         .progress

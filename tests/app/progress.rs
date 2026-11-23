@@ -23,13 +23,14 @@ fn long_document() -> Document {
 }
 
 #[test]
-fn paging_through_the_reader_moves_its_progress() {
+fn paging_to_the_end_finishes_and_copy_confirms() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = load_state(Some(dir.path().join("settings.json")));
     s.settings.configured = true;
     s.open_reader(long_document());
     let mut rt = Runtime::new(s, ui::view, (980.0, 780.0), Env::default());
     rt.on_key = Some(ui::on_key);
+    rt.poll = Some(poll);
     rt.frame(0.0);
     assert_eq!(rt.state.reading_fraction(), 0.0);
     for _ in 0..3 {
@@ -52,6 +53,13 @@ fn paging_through_the_reader_moves_its_progress() {
     }
     assert!(rt.state.reading_fraction() > 0.99);
     assert!(rt.find("reading-pill").is_some());
+    assert!(rt.state.reader.finished_at.is_some());
+    tap(&mut rt, "copy");
+    assert!(rt.state.reader.copied_at.is_some());
+    for _ in 0..50 {
+        rt.frame(0.05);
+    }
+    assert!(rt.state.reader.copied_at.is_none());
 }
 
 #[test]

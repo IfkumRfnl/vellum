@@ -37,7 +37,11 @@ pub fn view(s: &State, w: &Working) -> El {
                 .effect_data([t.shown, finished.map_or(-1.0, |at| at as f32), 0.0, 0.0])
                 .pin(Some(10.0), Some(6.0), Some(10.0), Some(6.0)),
         );
-    let percent = (t.shown * 100.0).floor().min(100.0) as i64;
+    let percent = if finished.is_some() {
+        100
+    } else {
+        (t.shown * 100.0).floor().min(99.0) as i64
+    };
     let number = RollingText::new("percent", format!("{percent}%"))
         .font(figures(40.0, 600.0))
         .color(c(INK))
@@ -45,10 +49,10 @@ pub fn view(s: &State, w: &Working) -> El {
         .build(kit());
     let (status, color) = if finished.is_some() {
         ("Ready".to_owned(), DONE)
-    } else if let Some(left) = t.remaining(s.clock) {
-        (format!("about {} left", timestamp(left.max(1.0))), MUTED)
     } else if !t.note.is_empty() {
         (t.note.clone(), MUTED)
+    } else if let Some(left) = t.time_left(s.clock) {
+        (format!("about {} left", timestamp(left)), MUTED)
     } else {
         ("Working…".to_owned(), MUTED)
     };

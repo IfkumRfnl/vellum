@@ -234,11 +234,24 @@ fn end(s: &State) -> El {
         row()
             .gap(10.0)
             .center_y()
-            .child(button("Copy transcript", Tone::Quiet, |s, tx| {
-                if let Some(all) = s.transcript_text() {
-                    tx.copy(all);
-                }
-            }))
+            .child(
+                button(
+                    if s.reader.copied_at.is_some() {
+                        "Copied"
+                    } else {
+                        "Copy transcript"
+                    },
+                    Tone::Quiet,
+                    |s, tx| {
+                        if let Some(all) = s.transcript_text() {
+                            tx.copy(all);
+                            s.reader.copied_at = Some(s.clock);
+                        }
+                    },
+                )
+                .key("copy")
+                .label("Copy transcript"),
+            )
             .child(button("Back to top", Tone::Ghost, |_, tx| {
                 tx.scroll_to_with(ARTICLE, 0.0, 0.0, rune::Spring::new(0.6, 0.0));
             })),

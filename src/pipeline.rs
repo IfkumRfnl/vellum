@@ -117,6 +117,9 @@ pub struct Tracker {
     /// The overall fraction on show, eased toward the target and never moving backwards.
     pub shown: f32,
     pub finished: Option<f64>,
+    /// The latest time-left estimate and when it was made, so the readout counts down through
+    /// steps that can't estimate instead of disappearing.
+    estimate: Option<(f64, f64)>,
 }
 
 impl Tracker {
@@ -138,6 +141,7 @@ impl Tracker {
             heard_until: 0.0,
             shown: 0.0,
             finished: None,
+            estimate: None,
         }
     }
 
@@ -271,6 +275,9 @@ impl Tracker {
 
     /// Moves the meter toward its target. True when what's on show changed.
     pub fn tick(&mut self, now: f64, dt: f64) -> bool {
+        if let Some(left) = self.remaining(now) {
+            self.estimate = Some((now, left));
+        }
         let target = self.target(now);
         let before = self.shown;
         let k = 1.0 - (-dt.max(0.0) * if self.finished.is_some() { 7.0 } else { 4.5 }).exp();
@@ -284,8 +291,14 @@ impl Tracker {
         (self.shown - before).abs() > 1e-5
     }
 
+    /// Seconds until the transcript is ready, from the latest estimate, counting down.
+    pub fn time_left(&self, now: f64) -> Option<f64> {
+        let (at, left) = self.estimate?;
+        Some((left - (now - at)).max(1.0))
+    }
+
     /// Seconds until the transcript is ready, once the current stage can say.
-    pub fn remaining(&self, now: f64) -> Option<f64> {
+    fn remaining(&self, now: f64) -> Option<f64> {
         let (stage, since) = self.current?;
         let fraction = f64::from(self.reported?.0);
         let elapsed = now - since;
@@ -379,5 +392,9 @@ mod tests {
         );
         assert_eq!(t.words, 3);
         assert_eq!(t.remaining(20.0), Some(30.0));
+        t.tick(20.0, 0.0);
+        // A step that can't estimate keeps counting down from the last estimate.
+        t.apply(Update::Stage(Stage::Speakers), 25.0);
+        assert_eq!(t.time_left(30.0), Some(20.0));
     }
 }
