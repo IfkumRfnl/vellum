@@ -47,7 +47,7 @@ When you move a build, keep the native libraries with it: the DLLs beside `vellu
 
 On first launch, choose a speech model. Parakeet Unified English (731 MB) is the English default. Whisper Small (270 MB) and Whisper Large v3 Turbo (886 MB) handle many languages. The model starts downloading in the background while you continue. **Skip** reads YouTube captions instead.
 
-Paste a link and press **Transcribe**. The model button in the top right switches models, chooses YouTube captions, or turns on **Use YouTube captions first**. **Label speakers** adds speaker turns.
+Paste a link and press **Transcribe**. When the video has its uploader's own captions, Vellum uses them, which takes seconds; otherwise it transcribes the audio with your speech model. The model button in the top right switches models or chooses YouTube captions, automatic ones included. **Label speakers** adds speaker turns.
 
 In the reader, **Aa** changes the typeface, size, reading width, line spacing and timestamps. The toolbar shows how far you are and how long is left at your reading pace.
 

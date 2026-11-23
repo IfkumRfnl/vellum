@@ -274,16 +274,28 @@ fn cues(data: CaptionData) -> Vec<Cue> {
 }
 
 impl Video {
-    pub fn captions(&self, progress: &Progress) -> Result<Option<(Vec<Cue>, String, String)>> {
+    /// The best caption track: the uploader's own, then (unless `official_only`) YouTube's
+    /// automatic ones.
+    pub fn captions(
+        &self,
+        progress: &Progress,
+        official_only: bool,
+    ) -> Result<Option<(Vec<Cue>, String, String)>> {
         let agent = ureq::AgentBuilder::new()
             .try_proxy_from_env(true)
             .timeout(Duration::from_secs(25))
             .build();
         let mut problem = None;
-        for (tracks, source) in [
+        let kinds = [
             (&self.subtitles, "YouTube captions"),
             (&self.automatic_captions, "YouTube auto-captions"),
-        ] {
+        ];
+        let kinds = if official_only {
+            &kinds[..1]
+        } else {
+            &kinds[..]
+        };
+        for &(tracks, source) in kinds {
             let mut langs: Vec<_> = tracks.keys().filter(|lang| *lang != "live_chat").collect();
             langs.sort_by_key(|lang| {
                 let base = lang.trim_end_matches("-orig");

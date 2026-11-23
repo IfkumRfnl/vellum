@@ -18,7 +18,10 @@ pub const DEFAULT_WPM: f32 = 238.0;
 pub struct Settings {
     pub configured: bool,
     pub model: String,
-    pub captions_first: bool,
+    /// With a speech model, use the uploader's own captions when a video has them instead of
+    /// transcribing. Always on in the app; the live accuracy tests turn it off to force
+    /// transcription.
+    pub official_captions: bool,
     pub speakers: bool,
     pub font: usize,
     pub size: u8,
@@ -34,7 +37,7 @@ impl Default for Settings {
         Self {
             configured: false,
             model: "parakeet_unified_en".into(),
-            captions_first: false,
+            official_captions: true,
             speakers: false,
             font: 0,
             size: 21,

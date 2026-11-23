@@ -51,7 +51,7 @@ impl Stage {
 /// The stages a job with these settings expects to run.
 pub fn plan(settings: &Settings) -> Vec<Stage> {
     let mut plan = vec![Stage::Fetch];
-    if settings.model == "captions" || settings.captions_first {
+    if settings.model == "captions" || settings.official_captions {
         plan.push(Stage::Captions);
     }
     if settings.model != "captions" || settings.speakers {
@@ -322,10 +322,10 @@ impl Tracker {
 mod tests {
     use super::*;
 
-    fn settings(model: &str, captions_first: bool, speakers: bool) -> Settings {
+    fn settings(model: &str, official_captions: bool, speakers: bool) -> Settings {
         Settings {
             model: model.into(),
-            captions_first,
+            official_captions,
             speakers,
             ..Settings::default()
         }

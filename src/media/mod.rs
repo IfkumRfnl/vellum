@@ -40,9 +40,11 @@ pub fn read_video(link: &str, settings: &Settings, progress: &Progress) -> Resul
         duration: video.duration,
     })?;
     let mut transcript = None;
-    if settings.model == "captions" || settings.captions_first {
+    if settings.model == "captions" || settings.official_captions {
         progress.stage(Stage::Captions)?;
-        transcript = match video.captions(progress) {
+        // Before a speech model, only the uploader's captions are worth taking: YouTube's
+        // automatic ones are usually less accurate than the model.
+        transcript = match video.captions(progress, settings.model != "captions") {
             Ok(track) => track,
             Err(_) if settings.model == "captions" => bail!(
                 "YouTube could not deliver this caption track. Choose a speech model to transcribe its audio."

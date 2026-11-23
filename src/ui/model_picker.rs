@@ -2,7 +2,7 @@
 
 use super::{
     theme::{ACCENT, EDGE, HOVER, INK, MUTED, PANEL, c, kit},
-    widgets::{Tone, button, heading, label, line, toggle},
+    widgets::{Tone, button, heading, label, line},
 };
 use crate::{State, media::models::SpeechModel};
 use rune::{El, col, el, row};
@@ -162,27 +162,13 @@ pub(super) fn source_picker(s: &State, layer: &mut Vec<El>) -> El {
                 .on_press(move |s: &mut State| s.select_model(id)),
         );
     }
-    let mut panel = col().gap(7.0).child(choices);
-    if s.settings.model != "captions" {
-        panel = panel.child(line()).child(
-            toggle(
-                "Use YouTube captions first",
-                s.settings.captions_first,
-                |s| {
-                    s.settings.captions_first = !s.settings.captions_first;
-                    s.save();
-                },
-            )
-            .px(8.0),
-        );
-    }
     rune_kit::Popover::new("sources")
         .label("Transcription")
         .trigger(trigger)
         .placement(rune_kit::Placement::BottomEnd)
         .padding(8.0)
         .child(
-            panel
+            choices
                 .modal(true, |s: &mut State| s.sources_open = false)
                 .focus_return("Transcription"),
         )

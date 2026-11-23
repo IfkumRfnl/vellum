@@ -19,7 +19,7 @@ fn continuing_uses_speech_and_skipping_can_be_reversed() {
     tap(&mut rt, "Continue");
     assert!(matches!(rt.state.screen, Screen::Home));
     assert_eq!(rt.state.settings.model, "parakeet_unified_en");
-    assert!(!rt.state.settings.captions_first);
+    assert!(rt.state.settings.official_captions);
     tap(&mut rt, "Label speakers");
     assert!(rt.state.settings.speakers);
     tap(&mut rt, "url");

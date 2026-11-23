@@ -4,14 +4,14 @@ use std::sync::Mutex;
 
 mod accuracy;
 
-fn read_video(url: &'static str, model: &str, captions_first: bool, speakers: bool) -> Document {
+fn read_video(url: &'static str, model: &str, official_captions: bool, speakers: bool) -> Document {
     // Each live case exercises the whole video. Give the local inference engine
     // one job at a time even when Cargo runs test functions concurrently.
     static SLOT: Mutex<()> = Mutex::new(());
     let _slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
     let settings = Settings {
         model: model.into(),
-        captions_first,
+        official_captions,
         speakers,
         ..Settings::default()
     };
