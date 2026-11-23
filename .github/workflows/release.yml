@@ -53,22 +53,42 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Crate sources only: a restored target/ keeps build-script results that point at
-      # native libraries outside it (sherpa-onnx's download), which the cache doesn't keep.
+      # Compiled Rust dependencies. sherpa-onnx's build script links from a download it
+      # keeps beside target/release, so that comes along too.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.label }}
-          cache-targets: false
+          env-vars: INCLUDE LIB ImageVersion
+          cache-directories: target/sherpa-onnx-prebuilt
+
+      # The native speech engine (ggml, and on Windows x64 and Linux its Vulkan shaders) is
+      # the slowest part to build. Each desktop builds it once per engine version and keeps
+      # the installed result; later builds link against that (TRANSCRIBE_DIR).
+      - name: Find the speech engine's version
+        shell: bash
+        run: |
+          version="$(grep -A1 '^name = "transcribe-cpp-sys"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          echo "ENGINE_KEY=transcribe-${{ matrix.label }}-$version-v1" >> "$GITHUB_ENV"
+      - name: Restore the speech engine
+        id: engine
+        uses: actions/cache/restore@v4
+        with:
+          path: .native/transcribe
+          key: ${{ env.ENGINE_KEY }}
+      - name: Use the restored speech engine
+        if: steps.engine.outputs.cache-hit == 'true'
+        shell: bash
+        run: echo "TRANSCRIBE_DIR=${{ github.workspace }}/.native/transcribe" >> "$GITHUB_ENV"
 
       # Windows x64 and Linux build the Vulkan speech backend.
       - name: Install the Vulkan SDK
-        if: matrix.label == 'windows-x64'
+        if: matrix.label == 'windows-x64' && steps.engine.outputs.cache-hit != 'true'
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.4.309.0
           cache: true
       - name: Install SPIRV-Headers
-        if: matrix.label == 'windows-x64'
+        if: matrix.label == 'windows-x64' && steps.engine.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           vcpkg install spirv-headers:x64-windows
@@ -107,6 +127,25 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked
+
+      # Keep the installed engine (not its 400 MB build tree, which leaves the Rust cache too).
+      - name: Keep the speech engine
+        if: steps.engine.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          manifest="$(find target/release/build -path '*transcribe-cpp-sys*' -name transcribe-link.json | head -1)"
+          prefix="$(dirname "$(dirname "$manifest")")"
+          mkdir -p .native/transcribe
+          for part in bin include lib lib64 share; do
+            if [ -e "$prefix/$part" ]; then cp -a "$prefix/$part" .native/transcribe/; fi
+          done
+          rm -rf "$prefix/build"
+      - name: Save the speech engine
+        if: steps.engine.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .native/transcribe
+          key: ${{ env.ENGINE_KEY }}
 
       - name: Package for Windows
         if: runner.os == 'Windows'
