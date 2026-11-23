@@ -7,10 +7,14 @@ use std::{
 fn main() -> io::Result<()> {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
-        stage_speech_libraries(&profile_dir().join("vellum-libs"), |name| {
-            name.ends_with(".so") || name.contains(".so.")
-        })?;
+        let libs = profile_dir().join("vellum-libs");
+        stage_speech_libraries(&libs, |name| name.ends_with(".so") || name.contains(".so."))?;
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/vellum-libs:$ORIGIN/../vellum-libs");
+        // Test binaries run from deep in Cargo's build directory, far from the libraries:
+        // development builds find them where they're staged. Releases stay relocatable.
+        if env::var("PROFILE").as_deref() == Ok("debug") {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libs.display());
+        }
     }
     #[cfg(windows)]
     if target_os == "windows" {
