@@ -53,10 +53,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Crate sources only: a restored target/ keeps build-script results that point at
+      # native libraries outside it (sherpa-onnx's download), which the cache doesn't keep.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.label }}
-          env-vars: INCLUDE LIB ImageVersion
+          cache-targets: false
 
       # Windows x64 and Linux build the Vulkan speech backend.
       - name: Install the Vulkan SDK
@@ -127,6 +129,7 @@ jobs:
             find target/release/build -maxdepth 3 -path '*transcribe*' -name '*.so*' | head
             echo "::error::the build staged no vellum-libs directory"; exit 1
           fi
+          echo "Speech libraries: $libs"
           cp -a "$libs" "$dir/"
           find target/release -maxdepth 1 -name '*.so*' -exec cp -a {} "$dir/" \;
           ls -la "$dir" "$dir/vellum-libs"

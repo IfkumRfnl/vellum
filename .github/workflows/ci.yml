@@ -21,7 +21,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # Crate sources only (see release.yml).
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - name: Install Linux libraries
         run: |
           sudo apt-get update
