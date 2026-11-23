@@ -14,7 +14,9 @@ publish = false
 
 [dependencies]
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "63ad0209edc9a3a7d2208b7f6c66f9e353da315d", default-features = false }
-rune = { git = "https://github.com/anomalyco/rune", rev = "63ad0209edc9a3a7d2208b7f6c66f9e353da315d" }
+# Only what Vellum uses: no audio and video playback, SVG rendering, embedded fallback fonts
+# (the theme registers its own) or Linux D-Bus services (Vellum is always dark, without a tray).
+rune = { git = "https://github.com/anomalyco/rune", rev = "63ad0209edc9a3a7d2208b7f6c66f9e353da315d", default-features = false, features = ["accessibility", "metal-backend"] }
 rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "63ad0209edc9a3a7d2208b7f6c66f9e353da315d" }
 wgpu = { version = "30.0.2", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 serde = { version = "1", features = ["derive"] }
