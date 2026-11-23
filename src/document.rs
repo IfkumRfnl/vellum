@@ -37,19 +37,6 @@ impl Document {
         self.paragraphs.iter().map(|p| word_count(&p.text)).sum()
     }
 
-    /// The whole transcript as plain text, speakers on their own line before each turn.
-    pub fn plain_text<'a>(&'a self, text: impl Fn(usize) -> &'a str) -> String {
-        self.paragraphs
-            .iter()
-            .enumerate()
-            .map(|(i, p)| match &p.speaker {
-                Some(speaker) => format!("{speaker}\n{}", text(i)),
-                None => text(i).to_owned(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-
     /// The video at `seconds`, for a timestamp's link.
     pub fn link_at(&self, seconds: f64) -> Option<String> {
         (!self.link.is_empty()).then(|| format!("{}&t={}s", self.link, seconds.max(0.0) as u64))

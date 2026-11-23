@@ -1,8 +1,7 @@
 //! The transcript, as one continuous page.
 //!
 //! Paragraphs are virtual rows, so a three-hour podcast scrolls as lightly as a short clip:
-//! only what's near the viewport is laid out. The title is the first row and the closing
-//! actions the last.
+//! only what's near the viewport is laid out. The title is the first row.
 
 mod appearance;
 mod hud;
@@ -19,8 +18,8 @@ use crate::{
 };
 use rune::{
     El, Family, GrowthSpec, Key, KeyEvent, ScrollSpec, TextStyle, Tx, WheelEvent, col, row, text,
-    text_input,
 };
+use rune_kit::{ScrollBar, ScrollBarStyle};
 use std::borrow::Cow;
 
 const SERIF: Family = Family::Named("Georgia, Constantia, DejaVu Serif");
@@ -29,17 +28,8 @@ const FACES: [Family; 3] = [SERIF, Family::Sans, Family::SystemMono];
 const ARTICLE: &str = "article";
 
 pub fn toolbar(s: &State) -> El {
-    let editing = s.reader.edits.is_some();
-    row()
+    let actions = row()
         .gap(8.0)
-        .child(button(
-            if editing { "Done" } else { "Edit" },
-            if editing { Tone::Primary } else { Tone::Quiet },
-            |s, tx| {
-                tx.instant();
-                s.toggle_editing();
-            },
-        ))
         .child(
             button(
                 "Aa",
@@ -56,25 +46,29 @@ pub fn toolbar(s: &State) -> El {
             .label("Reading appearance")
             .help("Reading appearance"),
         )
-        .child(button("New video", Tone::Quiet, |s, tx| s.new_video(tx)))
+        .child(button("New video", Tone::Quiet, |s, tx| s.new_video(tx)));
+    row()
+        .w_full()
+        .justify_between()
+        .center_y()
+        .child(hud::status(s))
+        .child(actions)
 }
 
 pub fn view(s: &State, doc: &Document) -> El {
     let width = s.settings.reading_width.points();
-    let count = doc.paragraphs.len() + 2;
+    let count = doc.paragraphs.len() + 1;
     let list = col()
         .key("paragraphs")
         .w_full()
         .growth(GrowthSpec::default())
-        .selection_group(s.reader.edits.is_none())
+        .selection_group(true)
         .virtual_rows(
             count,
             s.settings.size as f32 * 6.5,
-            move |s: &State, i| -> Cow<'_, str> {
-                let n = s.doc.as_ref().map_or(0, |d| d.paragraphs.len());
+            |_: &State, i| -> Cow<'_, str> {
                 match i {
                     0 => "head".into(),
-                    i if i > n => "end".into(),
                     i => format!("p-{}", i - 1).into(),
                 }
             },
@@ -82,7 +76,6 @@ pub fn view(s: &State, doc: &Document) -> El {
                 let doc = s.doc.as_ref().expect("reader has a transcript");
                 match i {
                     0 => head(s, doc),
-                    i if i > doc.paragraphs.len() => end(s),
                     i => paragraph(s, doc, i - 1),
                 }
             },
@@ -102,7 +95,7 @@ pub fn view(s: &State, doc: &Document) -> El {
                 .items_center()
                 .px(26.0)
                 .pt(34.0)
-                .pb(96.0)
+                .pb(64.0)
                 .child(
                     col()
                         .key("article-column")
@@ -110,7 +103,9 @@ pub fn view(s: &State, doc: &Document) -> El {
                         .max_w(width)
                         .child(list),
                 ),
-        );
+        )
+        .scroll_bar_styled(ScrollBarStyle::native(c("#3a3a3a"), c("#6b6b6b")).inside());
+
     let mut pane = col().key("reader").grow(1.0).min_h(0.0).child(hud::bar(s));
     if s.reader.appearance {
         pane = pane.child(
@@ -123,7 +118,7 @@ pub fn view(s: &State, doc: &Document) -> El {
                 .child(appearance::panel(s).max_w(660.0)),
         );
     }
-    pane.child(article).child(hud::pill(s))
+    pane.child(article)
 }
 
 fn style(s: &State) -> TextStyle {
@@ -199,59 +194,13 @@ fn paragraph(s: &State, doc: &Document, index: usize) -> El {
     if has_note {
         block = block.child(note);
     }
-    let style = style(s);
-    let body = if let Some(edits) = &s.reader.edits {
-        text_input(&edits[index], style)
-            .key(format!("edit-{index}"))
-            .label(format!("Paragraph {}", index + 1))
-            .w_full()
-            .min_h(style.line_px())
-            .color(c(INK))
-            .caret(c(INK), c(SELECTION))
-            .on_edit(move |s: &mut State| &mut s.reader.edits.as_mut().unwrap()[index])
-            .on_submit(move |s: &mut State, _| s.reader.edits.as_mut().unwrap()[index].insert("\n"))
-    } else {
-        text(&p.text)
-            .font(style)
-            .color(c(INK))
-            .wrap()
-            .selection_color(c(SELECTION))
-            .selectable(true)
-    };
+    let body = text(&p.text)
+        .font(style(s))
+        .color(c(INK))
+        .wrap()
+        .selection_color(c(SELECTION))
+        .selectable(true);
     block.child(body)
-}
-
-fn end(s: &State) -> El {
-    let mut end = col().w_full().gap(14.0).pt(8.0);
-    if let Some(note) = hud::finish_note(s) {
-        end = end.child(note);
-    }
-    end.child(
-        row()
-            .gap(10.0)
-            .center_y()
-            .child(
-                button(
-                    if s.reader.copied_at.is_some() {
-                        "Copied"
-                    } else {
-                        "Copy transcript"
-                    },
-                    Tone::Quiet,
-                    |s, tx| {
-                        if let Some(all) = s.transcript_text() {
-                            tx.copy(all);
-                            s.reader.copied_at = Some(s.clock);
-                        }
-                    },
-                )
-                .key("copy")
-                .label("Copy transcript"),
-            )
-            .child(button("Back to top", Tone::Ghost, |_, tx| {
-                tx.scroll_to_with(ARTICLE, 0.0, 0.0, rune::Spring::new(0.6, 0.0));
-            })),
-    )
 }
 
 pub fn font_wheel(s: &mut State, e: WheelEvent, _: &mut Tx) -> bool {
@@ -275,10 +224,7 @@ pub fn font_wheel(s: &mut State, e: WheelEvent, _: &mut Tx) -> bool {
 }
 
 /// Space pages down (Shift+Space up); Home and End glide to either end.
-pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
-    if s.reader.edits.is_some() {
-        return false;
-    }
+pub fn on_key(_: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
     match &e.key {
         Key::Text(t) if t == " " => tx.scroll_page(ARTICLE, if e.mods.shift { -1 } else { 1 }),
         Key::Home => tx.scroll_to_with(ARTICLE, 0.0, 0.0, rune::Spring::new(0.6, 0.0)),

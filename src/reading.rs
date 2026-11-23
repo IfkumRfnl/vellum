@@ -9,13 +9,11 @@
 /// Seconds of steady reading worth as much as the prior speed.
 const PRIOR_WEIGHT: f64 = 90.0;
 /// A step faster than this is skimming or jumping, not reading.
-const SKIM_WPM: f64 = 1100.0;
+const SKIM_WPM: f64 = 700.0;
 /// A pause longer than this is a break, not reading time.
 const BREAK: f64 = 75.0;
 /// Stillness after a scroll event that makes its position a resting place.
 const SETTLE: f64 = 0.5;
-/// The end counts as reached within this fraction of it.
-const END: f32 = 0.995;
 
 pub struct Reading {
     pub words: usize,
@@ -26,8 +24,6 @@ pub struct Reading {
     /// The latest scroll event and the latest resting place, as (seconds, words in).
     last: Option<(f64, f64)>,
     rest: Option<(f64, f64)>,
-    /// The end was reached; stays true.
-    pub finished: bool,
 }
 
 impl Reading {
@@ -40,7 +36,6 @@ impl Reading {
             measured_secs: 0.0,
             last: None,
             rest: None,
-            finished: false,
         }
     }
 
@@ -51,11 +46,6 @@ impl Reading {
         } else {
             (offset / max).clamp(0.0, 1.0)
         };
-        // Reaching the end counts once there was somewhere to scroll; a page that fits on one
-        // screen hasn't been read just by opening it.
-        if self.fraction >= END && max > 1.0 {
-            self.finished = true;
-        }
         let at = f64::from(self.fraction) * self.words as f64;
         if let Some((then, was)) = self.last
             && now - then > SETTLE
@@ -125,15 +115,13 @@ mod tests {
         assert!((r.wpm() - steady).abs() < 1e-9);
         assert_eq!(r.words_read(), 5000);
         r.observe(121.0, 6000.0, 6000.0);
-        assert!(r.finished);
         assert_eq!(r.words_left(), 0);
     }
 
     #[test]
-    fn a_page_that_fits_shows_whole_without_finishing() {
+    fn a_page_that_fits_is_whole() {
         let mut r = Reading::new(40, 240.0);
         r.observe(0.0, 0.0, 0.0);
         assert_eq!(r.fraction, 1.0);
-        assert!(!r.finished);
     }
 }

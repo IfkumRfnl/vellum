@@ -13,8 +13,6 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 /// How long the finished meter celebrates before the transcript opens.
 pub const CELEBRATION: f64 = 1.35;
-/// How long **Copy transcript** says it copied.
-pub const COPIED: f64 = 1.6;
 
 pub enum Screen {
     Models,
@@ -42,14 +40,10 @@ pub struct ModelJob {
 #[derive(Default)]
 pub struct ReaderState {
     pub appearance: bool,
-    pub edits: Option<Vec<TextEdit>>,
     pub wheel_remainder: f32,
     /// Shared with the scroll handler, which updates it on every frame of a scroll.
     pub progress: Rc<RefCell<Option<Reading>>>,
     pub hud: crate::ui::reader::Hud,
-    pub finished_at: Option<f64>,
-    /// When the transcript was last copied, for the button's confirmation.
-    pub copied_at: Option<f64>,
 }
 
 pub struct State {
@@ -189,7 +183,6 @@ impl State {
     }
 
     pub fn new_video(&mut self, tx: &mut Tx) {
-        self.finish_editing();
         self.keep_reading_speed();
         self.input = TextEdit::new("");
         self.message.clear();
@@ -224,44 +217,12 @@ impl State {
             .map_or(0.0, |r| r.fraction)
     }
 
-    pub fn toggle_editing(&mut self) {
-        if self.reader.edits.is_some() {
-            self.finish_editing();
-        } else if let Some(doc) = &self.doc {
-            self.reader.edits = Some(
-                doc.paragraphs
-                    .iter()
-                    .map(|p| TextEdit::new(p.text.clone()))
-                    .collect(),
-            );
-        }
-    }
-
-    pub fn finish_editing(&mut self) {
-        if let (Some(edits), Some(doc)) = (self.reader.edits.take(), self.doc.as_mut()) {
-            for (paragraph, mut edit) in doc.paragraphs.iter_mut().zip(edits) {
-                paragraph.text = std::mem::take(&mut edit.text);
-            }
-        }
-    }
-
     pub fn adjust_font(&mut self, steps: i32) {
         let size = (i32::from(self.settings.size).saturating_add(steps)).clamp(16, 32) as u8;
         if size != self.settings.size {
             self.settings.size = size;
             self.save();
         }
-    }
-
-    /// The transcript as plain text, with any corrections in progress.
-    pub fn transcript_text(&self) -> Option<String> {
-        let doc = self.doc.as_ref()?;
-        Some(doc.plain_text(|i| {
-            self.reader
-                .edits
-                .as_ref()
-                .map_or(doc.paragraphs[i].text.as_str(), |e| e[i].text.as_str())
-        }))
     }
 }
 
@@ -276,7 +237,6 @@ pub fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     changed |= poll_model(s);
     changed |= match &s.screen {
         Screen::Working(_) => poll_working(s, clock, dt, tx),
-        Screen::Reader => poll_reader(s, clock, tx),
         _ => false,
     };
     changed
@@ -346,31 +306,4 @@ fn poll_working(s: &mut State, clock: f64, dt: f64, tx: &mut Tx) -> bool {
     // The meter moves every frame while the job runs.
     tx.wake_after(Duration::from_millis(16));
     changed
-}
-
-fn poll_reader(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
-    if let Some(at) = s.reader.copied_at {
-        if clock - at >= COPIED {
-            s.reader.copied_at = None;
-            return true;
-        }
-        tx.wake_after(Duration::from_secs_f64(COPIED - (clock - at)));
-    }
-    let finished = s
-        .reader
-        .progress
-        .borrow()
-        .as_ref()
-        .is_some_and(|r| r.finished);
-    if finished && s.reader.finished_at.is_none() {
-        s.reader.finished_at = Some(clock);
-        s.keep_reading_speed();
-        return true;
-    }
-    // The time-left estimate refines while you read; the handler refreshes it on scroll, and
-    // this checks for the end of the transcript between scrolls.
-    if s.reader.finished_at.is_none() {
-        tx.wake_after(Duration::from_millis(400));
-    }
-    false
 }

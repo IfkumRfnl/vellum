@@ -39,6 +39,17 @@ fn main() {
         on_key: Some(ui::on_key),
         ..AppSpec::new("Vellum", (980.0, 780.0), app::init, ui::view)
     })
+    .args(rune_args())
     .compositor(ui::fx::Gfx::default())
     .run();
+}
+
+/// Rune's flags from the command line, with a scroll bar that stays while the page overflows
+/// unless the command line chooses otherwise.
+fn rune_args() -> Vec<String> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.iter().any(|a| a == "--scroll-bars") {
+        args.extend(["--scroll-bars".into(), "always".into()]);
+    }
+    args
 }

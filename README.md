@@ -18,8 +18,8 @@ Vellum is a native desktop app written in Rust with [Rune](https://github.com/an
 - **Local speech recognition.** Parakeet Unified English, Whisper Small and Whisper Large v3 Turbo through [transcribe.cpp](https://crates.io/crates/transcribe-cpp), on Vulkan, Metal or the CPU. No Python, nothing uploaded.
 - **Speaker labels** from sherpa-onnx's pyannote segmentation and TitaNet embeddings.
 - **One progress indicator.** A plate of dots fills as the transcript is made, with the percentage, the time left and the words as they're recognized.
-- **Reading progress.** A hairline along the top and a small pill show how far you are, how long is left and your reading pace, which Vellum learns from how you scroll and remembers.
-- **Made for reading.** One continuous page; serif, sans or mono; adjustable size, width and spacing; timestamps open the video at that moment; corrections in place.
+- **Reading progress.** A hairline along the top fills as you read, and the toolbar shows how far you are and the time left at your reading pace, which Vellum learns from how you scroll and remembers.
+- **Made for reading.** One continuous page; serif, sans or mono; adjustable size, width and spacing; timestamps open the video at that moment.
 
 ## Install and run
 
@@ -49,7 +49,7 @@ On first launch, choose a speech model. Parakeet Unified English (731 MB) is the
 
 Paste a link and press **Transcribe**. The model button in the top right switches models, chooses YouTube captions, or turns on **Use YouTube captions first**. **Label speakers** adds speaker turns.
 
-In the reader, **Aa** changes the typeface, size, reading width, line spacing and timestamps. **Edit** lets you correct paragraphs. **Copy transcript** at the end of the page copies everything, including your corrections and speaker labels.
+In the reader, **Aa** changes the typeface, size, reading width, line spacing and timestamps. The toolbar shows how far you are and how long is left at your reading pace.
 
 | Keys | Action |
 | --- | --- |

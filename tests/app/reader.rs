@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn reader_corrects_text_and_remembers_width_and_zoom() {
+fn reader_remembers_width_and_zoom() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.json");
     let mut s = load_state(Some(path.clone()));
@@ -48,23 +48,6 @@ fn reader_corrects_text_and_remembers_width_and_zoom() {
     rt.wheel_event(rune::WheelEvent::new(0.0, 40.0).at(x, y));
     rt.frame(0.02);
     assert_eq!(rt.state.settings.size, 22);
-    tap(&mut rt, "Edit");
-    tap(&mut rt, "edit-0");
-    rt.key(rune::KeyEvent {
-        key: rune::Key::Command('a'),
-        mods: rune::Mods {
-            cmd: true,
-            ..Default::default()
-        },
-    });
-    rt.frame(0.02);
-    rt.paste("I read the right word.");
-    rt.frame(0.02);
-    tap(&mut rt, "Done");
-    let p = &rt.state.doc.as_ref().unwrap().paragraphs[0];
-    assert_eq!(p.text, "I read the right word.");
-    assert_eq!(p.speaker.as_deref(), Some("Speaker 3"));
-    assert_eq!(p.start, 23.0);
     drop(rt);
     let saved = load_state(Some(path));
     assert!(saved.settings.reading_width == ReadingWidth::Wide);

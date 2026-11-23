@@ -30,4 +30,4 @@ cargo test --release --locked tests::live -- --ignored --test-threads=1 --nocapt
 
 The live suite uses yt-dlp, FFmpeg, a supported JavaScript runtime and the same native inference engines as the app. Videos and caption URLs are fetched afresh. Cached models are reused. An explicitly enabled live case can download missing weights. Set `HF_HUB_OFFLINE=1` to require cached weights while still fetching videos from YouTube. Set `TRANSCRIBE_BACKENDS=cpu` before starting the test process to exercise CPU inference.
 
-The offline UI cases cover model selection, editing, reading width, zoom, saved preferences, the progress screen's finish and cancel, and reading progress while paging through a long transcript. Model preparation has its own opt-in case. To run that alongside the live suite, use the full verification command in the project README.
+The offline UI cases cover model selection, reading width, zoom, saved preferences, the progress screen's finish and cancel, and reading progress while paging through a long transcript. Model preparation has its own opt-in case. To run that alongside the live suite, use the full verification command in the project README.
