@@ -16,7 +16,7 @@
 Vellum is a native desktop app written in Rust with [Rune](https://github.com/anomalyco/rune). It reads a video's captions, or downloads its audio and transcribes it locally with Parakeet or Whisper, optionally labelling speakers.
 
 - **Local speech recognition.** Parakeet Unified English, Whisper Small and Whisper Large v3 Turbo through [transcribe.cpp](https://crates.io/crates/transcribe-cpp), on Vulkan, Metal or the CPU. No Python, nothing uploaded.
-- **Speaker labels.** Vellum can tell voices apart and label each speaker's turns.
+- **Speaker labels.** Vellum can tell up to four voices apart and label each speaker's turns, on the GPU when there is one.
 - **One progress indicator.** A plate of dots fills as the transcript is made, with the percentage, the time left and the words as they're recognized.
 - **Reading progress.** A hairline along the top fills as you read, and the toolbar shows how far you are and the time left at your reading pace, which Vellum learns from how you scroll and remembers.
 - **Made for reading.** One continuous page; serif, sans or mono; adjustable size, width and spacing; timestamps open the video at that moment.
@@ -71,7 +71,7 @@ See [tests/README.md](tests/README.md) for the optional tests that transcribe re
 
 ## Credits
 
-Vellum stands on [Rune](https://github.com/anomalyco/rune) for its interface, [transcribe.cpp](https://crates.io/crates/transcribe-cpp) and [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) for speech and speaker recognition, NVIDIA's [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (CC-BY-4.0) and OpenAI's [Whisper](https://github.com/openai/whisper) (MIT) models, [pyannote](https://github.com/pyannote/pyannote-audio) segmentation and NVIDIA's TitaNet speaker embeddings, [yt-dlp](https://github.com/yt-dlp/yt-dlp), [FFmpeg](https://ffmpeg.org) and the [Inter](https://rsms.me/inter/) typeface.
+Vellum stands on [Rune](https://github.com/anomalyco/rune) for its interface, [transcribe.cpp](https://crates.io/crates/transcribe-cpp) for speech and speaker recognition, NVIDIA's [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (CC-BY-4.0) and OpenAI's [Whisper](https://github.com/openai/whisper) (MIT) models, NVIDIA's [Streaming Sortformer](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1) speaker model (NVIDIA Open Model License), [yt-dlp](https://github.com/yt-dlp/yt-dlp), [FFmpeg](https://ffmpeg.org) and the [Inter](https://rsms.me/inter/) typeface.
 
 ## License
 

@@ -23,7 +23,7 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
 
-      # Compiled dependencies, sherpa-onnx's download and the built speech engine, shared
+      # Compiled dependencies and the built speech engine, shared
       # with the Linux x64 release build (see release.yml).
       - uses: Swatinem/rust-cache@v2
         with:
@@ -31,18 +31,7 @@ jobs:
       - name: Find the native libraries' versions
         run: |
           version() { grep -A1 "^name = \"$1\"$" Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p'; }
-          echo "SHERPA_KEY=sherpa-linux-x64-$(version sherpa-onnx-sys)" >> "$GITHUB_ENV"
           echo "ENGINE_KEY=transcribe-linux-x64-$(version transcribe-cpp-sys)-v1" >> "$GITHUB_ENV"
-      - name: Restore sherpa-onnx's download
-        id: sherpa
-        uses: actions/cache@v4
-        with:
-          path: target/sherpa-onnx-prebuilt
-          key: ${{ env.SHERPA_KEY }}
-      # Without it, sherpa-onnx's build script must run again to fetch it.
-      - name: Fetch sherpa-onnx again
-        if: steps.sherpa.outputs.cache-hit != 'true'
-        run: cargo clean -p sherpa-onnx-sys
       - name: Restore the speech engine
         id: engine
         uses: actions/cache/restore@v4

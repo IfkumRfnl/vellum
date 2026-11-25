@@ -30,13 +30,6 @@ ureq = { version = "2.12", features = ["json"] }
 hound = "3.5"
 sha2 = "0.10"
 
-[target.'cfg(windows)'.dependencies]
-sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["shared"] }
-libloading = "0.8"
-
-[target.'cfg(not(windows))'.dependencies]
-sherpa-onnx = "=1.13.8"
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

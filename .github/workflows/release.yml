@@ -64,28 +64,13 @@ jobs:
           env-vars: ${{ runner.os == 'Windows' && 'CARGO CC CFLAGS CXX CMAKE RUST INCLUDE LIB ImageVersion' || 'CARGO CC CFLAGS CXX CMAKE RUST' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # sherpa-onnx's build script links from a download it keeps in target/, which the step
-      # above cleans out before saving. Kept separately (this step's save runs first).
       - name: Find the native libraries' versions
         shell: bash
         run: |
           version() { grep -A1 "^name = \"$1\"$" Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p'; }
           toolset=""
           if [[ "${{ matrix.label }}" == windows-arm64 ]]; then toolset="-$ImageVersion"; fi
-          echo "SHERPA_KEY=sherpa-${{ matrix.label }}-$(version sherpa-onnx-sys)" >> "$GITHUB_ENV"
           echo "ENGINE_KEY=transcribe-${{ matrix.label }}-$(version transcribe-cpp-sys)$toolset-v1" >> "$GITHUB_ENV"
-      - name: Restore sherpa-onnx's download
-        id: sherpa
-        uses: actions/cache@v4
-        with:
-          path: target/sherpa-onnx-prebuilt
-          key: ${{ env.SHERPA_KEY }}
-      # Without it, sherpa-onnx's build script must run again to fetch it.
-      - name: Fetch sherpa-onnx again
-        if: steps.sherpa.outputs.cache-hit != 'true'
-        shell: bash
-        run: cargo clean --release -p sherpa-onnx-sys
-
       # The native speech engine (ggml, and on Windows x64 and Linux its Vulkan shaders) is
       # the slowest part to build. Each desktop builds it once per engine version and keeps
       # the installed result; later builds link against that (TRANSCRIBE_DIR). The Windows

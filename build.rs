@@ -23,8 +23,6 @@ fn main() -> io::Result<()> {
         for dest in [profile.clone(), profile.join("deps")] {
             stage_speech_libraries(&dest, |name| name.ends_with(".dll"))?;
         }
-        println!("cargo:rustc-link-lib=delayimp");
-        println!("cargo:rustc-link-arg=/DELAYLOAD:sherpa-onnx-c-api.dll");
         println!("cargo:rerun-if-changed=assets/vellum.ico");
         winresource::WindowsResource::new()
             .set_icon("assets/vellum.ico")

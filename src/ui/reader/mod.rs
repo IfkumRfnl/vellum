@@ -200,7 +200,11 @@ fn paragraph(s: &State, doc: &Document, index: usize) -> El {
         }
         note = note.child(stamp);
     }
-    if let Some(name) = &p.speaker {
+    // A speaker is named where their turn begins, not on each of its paragraphs.
+    let turn = index
+        .checked_sub(1)
+        .is_none_or(|i| doc.paragraphs[i].speaker != p.speaker);
+    if let Some(name) = p.speaker.as_ref().filter(|_| turn) {
         if has_note {
             note = note.child(label("   ·   ", small, MUTED));
         }

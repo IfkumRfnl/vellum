@@ -62,19 +62,14 @@ pub const SPEECH: [SpeechModel; 3] = [
     },
 ];
 
-pub const SEGMENTATION: Artifact = Artifact {
-    repo: "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0",
-    revision: "9403a6902bb58e3d5ae8c7e77c3422de279db2e0",
-    filename: "model.onnx",
-    bytes: 5992913,
-    digest: "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
-};
-pub const EMBEDDING: Artifact = Artifact {
-    repo: "csukuangfj/speaker-embedding-models",
-    revision: "a8055d6daef723a6a4ecf4de233708575bf4994f",
-    filename: "nemo_en_titanet_small.onnx",
-    bytes: 40257283,
-    digest: "ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e",
+/// NVIDIA's Streaming Sortformer: who spoke when, for up to four speakers, on the same
+/// devices as the speech models. Q8_0 labels 99% of speech as F16 does at 60% of the size.
+pub const SPEAKERS: Artifact = Artifact {
+    repo: "handy-computer/diar_streaming_sortformer_4spk-v2.1-gguf",
+    revision: "60ebab3ef7cae9869be0abcde13360347e96ba03",
+    filename: "diar_streaming_sortformer_4spk-v2.1-Q8_0.gguf",
+    bytes: 139310336,
+    digest: "a5dacdc650790266c7a362e54e6bf51952015487edaa606c4e11632bc32442a9",
 };
 
 pub fn speech(id: &str) -> Result<&'static SpeechModel> {

@@ -135,6 +135,12 @@ pub(super) fn join_words<'a>(pieces: impl Iterator<Item = &'a str>) -> String {
     text
 }
 
+fn ends_sentence(text: &str) -> bool {
+    text.trim_end()
+        .trim_end_matches(['”', '"', '’', ')'])
+        .ends_with(['.', '!', '?', '…', '。', '！', '？'])
+}
+
 fn paragraphs(cues: Vec<Cue>) -> Vec<Paragraph> {
     let mut result: Vec<Paragraph> = Vec::new();
     let mut end = 0.;
@@ -147,10 +153,7 @@ fn paragraphs(cues: Vec<Cue>) -> Vec<Paragraph> {
             continue;
         }
         let new_paragraph = result.last().is_none_or(|p| {
-            let sentence_end = p
-                .text
-                .trim_end_matches(['”', '"', '’', ')'])
-                .ends_with(['.', '!', '?', '…', '。', '！', '？']);
+            let sentence_end = ends_sentence(&p.text);
             turn || p.speaker != cue.speaker
                 || cue.start - end >= 2.2
                 || length >= 650

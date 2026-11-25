@@ -39,11 +39,16 @@ impl Document {
 
     /// The whole transcript as plain text, each speaker's name on its own line before their turn.
     pub fn plain_text(&self) -> String {
+        let mut previous = None;
         self.paragraphs
             .iter()
-            .map(|p| match &p.speaker {
-                Some(speaker) => format!("{speaker}\n{}", p.text),
-                None => p.text.clone(),
+            .map(|p| {
+                let turn = previous != Some(&p.speaker);
+                previous = Some(&p.speaker);
+                match &p.speaker {
+                    Some(speaker) if turn => format!("{speaker}\n{}", p.text),
+                    _ => p.text.clone(),
+                }
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -124,13 +129,18 @@ mod tests {
                     text: "Hello.".into(),
                 },
                 Paragraph {
+                    start: 1.0,
+                    speaker: Some("Speaker 1".into()),
+                    text: "Again.".into(),
+                },
+                Paragraph {
                     start: 2.0,
                     speaker: None,
                     text: "Bye.".into(),
                 },
             ],
         };
-        assert_eq!(doc.plain_text(), "Speaker 1\nHello.\n\nBye.");
+        assert_eq!(doc.plain_text(), "Speaker 1\nHello.\n\nAgain.\n\nBye.");
     }
 
     #[test]
