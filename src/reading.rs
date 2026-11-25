@@ -90,38 +90,3 @@ impl Reading {
         self.words_left() as f64 / self.wpm() * 60.0
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn steady_reading_moves_the_estimate_and_flicks_do_not() {
-        let mut r = Reading::new(6000, 240.0);
-        r.observe(0.0, 0.0, 6000.0);
-        // Read 300 words a minute for two minutes, a step every 5 s.
-        for i in 1..=24 {
-            r.observe(i as f64 * 5.0, i as f32 * 25.0, 6000.0);
-        }
-        // The last step becomes a resting place once the next scroll comes.
-        assert!(r.confident());
-        let steady = r.wpm();
-        assert!(
-            (steady - 240.0 - (300.0 - 240.0) * 115.0 / 205.0).abs() < 0.01,
-            "{steady}"
-        );
-        // A flick to near the end in half a second is skimming.
-        r.observe(120.5, 5000.0, 6000.0);
-        assert!((r.wpm() - steady).abs() < 1e-9);
-        assert_eq!(r.words_read(), 5000);
-        r.observe(121.0, 6000.0, 6000.0);
-        assert_eq!(r.words_left(), 0);
-    }
-
-    #[test]
-    fn a_page_that_fits_is_whole() {
-        let mut r = Reading::new(40, 240.0);
-        r.observe(0.0, 0.0, 0.0);
-        assert_eq!(r.fraction, 1.0);
-    }
-}

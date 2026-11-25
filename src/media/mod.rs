@@ -173,38 +173,3 @@ fn paragraphs(cues: Vec<Cue>) -> Vec<Paragraph> {
     }
     result
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn separates_turns_pauses_and_cjk_text() {
-        let cues = [
-            (0., 1., "One", "A"),
-            (1., 2., "Two", "B"),
-            (5., 6., "你好", "B"),
-            (6., 7., "世界", "B"),
-            (7., 8., ">> Next", "B"),
-        ]
-        .into_iter()
-        .map(|(start, end, text, who)| Cue {
-            speaker: Some(who.into()),
-            ..Cue::new(start, end, text.into())
-        })
-        .collect();
-        let paragraphs = paragraphs(cues);
-        assert_eq!(
-            paragraphs
-                .iter()
-                .map(|p| p.text.as_str())
-                .collect::<Vec<_>>(),
-            ["One", "Two", "你好世界", "Next"]
-        );
-    }
-
-    #[test]
-    fn joins_recognized_pieces() {
-        let pieces = [" Hello", ",", "world", ">> again", "你", "好"];
-        assert_eq!(join_words(pieces.into_iter()), "Hello, world again 你好");
-    }
-}

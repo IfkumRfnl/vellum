@@ -1,10 +1,103 @@
 use super::*;
-use crate::pipeline::Update;
-use std::sync::Mutex;
+use crate::pipeline::{Stage, Update};
+use std::{fmt::Write as _, io::Write as _, sync::Mutex};
 
 mod accuracy;
+mod reference;
+mod score;
 
-fn read_video(url: &'static str, model: &str, official_captions: bool, speakers: bool) -> Document {
+/// One video read as the app reads it, and how long each stage took.
+struct Run {
+    doc: Document,
+    /// The video's length, in seconds.
+    duration: f64,
+    /// The device that recognized the speech, as the progress screen names it.
+    device: String,
+    stages: Vec<(Stage, Duration)>,
+    total: Duration,
+}
+
+impl Run {
+    fn time(&self, stage: Stage) -> Option<Duration> {
+        self.stages
+            .iter()
+            .find(|(s, _)| *s == stage)
+            .map(|(_, took)| *took)
+    }
+
+    fn on_gpu(&self) -> bool {
+        !self.device.is_empty() && self.device != "CPU"
+    }
+
+    /// How many seconds of audio `stage` got through per second.
+    fn speed(&self, stage: Stage) -> Option<f64> {
+        self.time(stage)
+            .map(|took| self.duration / took.as_secs_f64().max(1e-3))
+    }
+
+    /// "Vulkan · RTX 4060 | 6:12 of audio | transcribe 0:05 (74× real time) · … | total 0:31"
+    fn timing(&self) -> String {
+        let mut stages = String::new();
+        for (stage, took) in &self.stages {
+            if !stages.is_empty() {
+                stages.push_str(" · ");
+            }
+            let _ = write!(
+                stages,
+                "{} {}",
+                format!("{stage:?}").to_lowercase(),
+                clock(*took)
+            );
+            if matches!(stage, Stage::Transcribe | Stage::Speakers) {
+                let _ = write!(stages, " ({:.0}× real time)", self.speed(*stage).unwrap());
+            }
+        }
+        format!(
+            "{} | {} of audio | {stages} | total {}",
+            if self.device.is_empty() {
+                "no speech model"
+            } else {
+                &self.device
+            },
+            clock(Duration::from_secs_f64(self.duration)),
+            clock(self.total)
+        )
+    }
+}
+
+/// 1:05:09, 4:07
+fn clock(d: Duration) -> String {
+    crate::document::timestamp(d.as_secs_f64().round())
+}
+
+/// Prints a test's results and keeps them in target/live-report.md, apart from the engine's logs.
+fn report(name: &str, lines: &[String]) {
+    let text = format!(
+        "## {name}
+
+{}
+
+",
+        lines.join(
+            "
+"
+        )
+    );
+    eprint!(
+        "
+{text}"
+    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/live-report.md");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(text.as_bytes());
+    }
+}
+
+fn read_video(url: &'static str, model: &str, official_captions: bool, speakers: bool) -> Run {
     // Each live case exercises the whole video. Give the local inference engine
     // one job at a time even when Cargo runs test functions concurrently.
     static SLOT: Mutex<()> = Mutex::new(());
@@ -19,22 +112,40 @@ fn read_video(url: &'static str, model: &str, official_captions: bool, speakers:
         media::read_video(url, &settings, progress).map(Event::Result)
     });
     let start = Instant::now();
-    let budget = Duration::from_secs(900);
-    let mut seen_device = false;
+    // Enough to download and read a three-hour podcast on the CPU.
+    let budget = Duration::from_secs(3600);
+    let mut duration = 0.0;
+    let mut device = String::new();
+    let mut began: Vec<(Stage, Instant)> = Vec::new();
     loop {
         match job
             .events
             .recv_timeout(budget.saturating_sub(start.elapsed()))
             .unwrap_or_else(|e| panic!("{url} ({model}): {e}"))
         {
-            Event::Update(Update::Device(device)) if !seen_device => {
-                eprintln!("{model}: {device}");
-                seen_device = true;
-            }
-            Event::Update(Update::Stage(stage)) => eprintln!("{model}: {stage:?}"),
+            Event::Update(Update::Video { duration: d, .. }) => duration = d.unwrap_or_default(),
+            Event::Update(Update::Device(d)) if device.is_empty() => device = d,
+            Event::Update(Update::Stage(stage)) => began.push((stage, Instant::now())),
             Event::Update(Update::Note(note)) => eprintln!("{model}: {note}"),
             Event::Update(_) => {}
-            Event::Result(doc) => return doc,
+            Event::Result(doc) => {
+                let end = Instant::now();
+                let stages = began
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (stage, at))| {
+                        let until = began.get(i + 1).map_or(end, |next| next.1);
+                        (*stage, until - *at)
+                    })
+                    .collect();
+                return Run {
+                    doc,
+                    duration,
+                    device,
+                    stages,
+                    total: end - start,
+                };
+            }
             Event::Error(error) => panic!("{url} ({model}): {error}"),
             Event::Cached(_) => panic!("unexpected model preparation result"),
         }
@@ -90,34 +201,12 @@ fn youtube_link_opens_reader_and_remembers_type() {
 #[test]
 #[ignore = "downloads a captioned video and labels the existing caption text"]
 fn labels_the_publishers_captions_without_running_speech_recognition() {
-    let doc = read_video("https://youtu.be/jNQXAC9IVRw", "captions", false, true);
+    let doc = read_video("https://youtu.be/jNQXAC9IVRw", "captions", false, true).doc;
     assert_eq!(doc.source, "YouTube captions");
     assert_eq!(doc.speaker_note, "Estimated speakers");
     assert!(
         doc.paragraphs
             .iter()
             .any(|p| p.speaker.is_some() && p.text.to_lowercase().contains("elephant"))
-    );
-}
-
-#[test]
-#[ignore = "downloads a public video's audio and runs native speech and speaker inference"]
-fn transcribes_video_audio_and_labels_speech() {
-    let doc = read_video(
-        "https://youtu.be/jNQXAC9IVRw",
-        "parakeet_unified_en",
-        false,
-        true,
-    );
-    assert_eq!(doc.source, "Parakeet Unified English");
-    assert!(
-        doc.paragraphs
-            .iter()
-            .any(|p| p.text.to_lowercase().contains("elephant"))
-    );
-    assert!(
-        doc.paragraphs.iter().any(|p| p.speaker.is_some()),
-        "{}",
-        doc.speaker_note
     );
 }
