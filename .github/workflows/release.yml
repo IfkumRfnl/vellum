@@ -230,12 +230,40 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      # The release's notes are its section of CHANGELOG.md, then which download is whose.
+      - name: Write the release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/vellum-$version"
+          cat >> notes.md <<NOTES
+
+          ### Downloads
+
+          | System | Download |
+          | --- | --- |
+          | Windows x64 | [vellum-$version-windows-x64.zip]($base-windows-x64.zip) |
+          | Windows ARM64 | [vellum-$version-windows-arm64.zip]($base-windows-arm64.zip) |
+          | macOS Apple Silicon | [vellum-$version-macos-arm64.zip]($base-macos-arm64.zip) |
+          | macOS Intel | [vellum-$version-macos-x64.zip]($base-macos-x64.zip) |
+          | Linux x64 | [vellum-$version-linux-x64.tar.gz]($base-linux-x64.tar.gz) |
+          | Linux ARM64 | [vellum-$version-linux-arm64.tar.gz]($base-linux-arm64.tar.gz) |
+
+          Vellum also needs [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases) with Node.js 22+ or Deno, and [FFmpeg](https://ffmpeg.org/download.html). The Mac app isn't notarized: the first time, right-click it and choose **Open**.
+          NOTES
+          cat notes.md
       - uses: softprops/action-gh-release@v2
         with:
           name: Vellum ${{ github.ref_name }}
           files: dist/*
-          generate_release_notes: true
+          body_path: notes.md

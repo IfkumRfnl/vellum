@@ -23,7 +23,7 @@ Vellum is a native desktop app written in Rust with [Rune](https://github.com/an
 
 ## Install
 
-Download Vellum for your system from the [latest release](https://github.com/IfkumRfnl/vellum/releases/latest): Windows (x64, ARM64), macOS (Apple Silicon, Intel) or Linux (x64, ARM64). Unpack it and run `vellum`, or open `Vellum.app` on a Mac. The Mac app isn't notarized, so the first time, right-click it and choose **Open**.
+Download Vellum for your system from the [latest release](https://github.com/IfkumRfnl/vellum/releases/latest): Windows (x64, ARM64), macOS (Apple Silicon, Intel) or Linux (x64, ARM64). Unpack it and run `vellum`, or open `Vellum.app` on a Mac. The Mac app isn't notarized, so the first time, right-click it and choose **Open**. What's new in each release is in the [changelog](CHANGELOG.md).
 
 Vellum also needs [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases), with Node.js 22+ or Deno, and [FFmpeg](https://ffmpeg.org/download.html). It finds them beside its executable or on your `PATH`, and on a Mac in Homebrew's directories too.
 
