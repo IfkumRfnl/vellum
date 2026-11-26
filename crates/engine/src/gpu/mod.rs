@@ -88,6 +88,12 @@ fn instance(backends: wgpu::Backends) -> wgpu::Instance {
     wgpu::Instance::new(desc)
 }
 
+/// The bytes of f16 values, without copying them.
+fn bytemuck_f16(data: &[f16]) -> &[u8] {
+    // SAFETY: f16 is a plain 2-byte value with no padding; u8 has alignment 1.
+    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
+}
+
 /// The engine's device and what it can do.
 pub struct Gpu {
     pub adapter: wgpu::Adapter,
@@ -107,50 +113,78 @@ pub struct Gpu {
     next_id: AtomicU64,
 }
 
+/// The usual case — no adapter or backend asked for — without starting every backend: listing
+/// adapters on all of them costs a few hundred milliseconds of load time. The first-choice
+/// backend (Vulkan, or Metal on Apple) is asked alone for a discrete GPU (any GPU on Apple);
+/// `None` sends the choice through [`choose_adapter`].
+fn quick_adapter(options: &GpuOptions) -> Option<wgpu::Adapter> {
+    if options.adapter.is_some() || options.backends.is_some() {
+        return None;
+    }
+    let apple = cfg!(target_vendor = "apple");
+    let first = if apple {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN
+    };
+    let mut found = block_on(instance(first).enumerate_adapters(first));
+    found.retain(|a| apple || a.get_info().device_type == wgpu::DeviceType::DiscreteGpu);
+    found.sort_by_key(|a| rank(&a.get_info()));
+    found.into_iter().next()
+}
+
+/// The adapter `options` asks for, among every backend's, numbered as [`adapters`] lists them.
+fn choose_adapter(options: &GpuOptions) -> Result<wgpu::Adapter> {
+    // Every adapter, numbered as `adapters` lists them, then only the allowed backends.
+    let instance = instance(wgpu::Backends::all());
+    let backends = options.backends.unwrap_or(wgpu::Backends::all());
+    let adapters: Vec<(usize, wgpu::Adapter)> =
+        block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .enumerate()
+            .filter(|(_, a)| backends.contains(a.get_info().backend.into()))
+            .collect();
+    let count = adapters.last().map_or(0, |(i, _)| i + 1);
+    let mut candidates: Vec<&wgpu::Adapter> = match &options.adapter {
+        // A number is an index when there's an adapter with it ("4060" is a name part).
+        Some(want) => match want.parse::<usize>().ok().filter(|i| *i < count) {
+            Some(index) => adapters
+                .iter()
+                .filter(|(i, _)| *i == index)
+                .map(|(_, a)| a)
+                .collect(),
+            None => {
+                let want = want.to_lowercase();
+                adapters
+                    .iter()
+                    .map(|(_, a)| a)
+                    .filter(|a| a.get_info().name.to_lowercase().contains(&want))
+                    .collect()
+            }
+        },
+        None => adapters
+            .iter()
+            .map(|(_, a)| a)
+            .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .collect(),
+    };
+    // The best of the matching ones (the Vulkan one before the DX12 one).
+    candidates.sort_by_key(|a| rank(&a.get_info()));
+    Ok((*candidates.first().ok_or_else(|| {
+        Error::Other(format!(
+            "no GPU adapter matches {:?} on {backends:?}",
+            options.adapter.as_deref().unwrap_or("any")
+        ))
+    })?)
+    .clone())
+}
+
 impl Gpu {
     pub fn new(options: &GpuOptions) -> Result<Gpu> {
-        // Every adapter, numbered as `adapters` lists them, then only the allowed backends.
-        let instance = instance(wgpu::Backends::all());
-        let backends = options.backends.unwrap_or(wgpu::Backends::all());
-        let adapters: Vec<(usize, wgpu::Adapter)> =
-            block_on(instance.enumerate_adapters(wgpu::Backends::all()))
-                .into_iter()
-                .enumerate()
-                .filter(|(_, a)| backends.contains(a.get_info().backend.into()))
-                .collect();
-        let count = adapters.last().map_or(0, |(i, _)| i + 1);
-        let mut candidates: Vec<&wgpu::Adapter> = match &options.adapter {
-            // A number is an index when there's an adapter with it ("4060" is a name part).
-            Some(want) => match want.parse::<usize>().ok().filter(|i| *i < count) {
-                Some(index) => adapters
-                    .iter()
-                    .filter(|(i, _)| *i == index)
-                    .map(|(_, a)| a)
-                    .collect(),
-                None => {
-                    let want = want.to_lowercase();
-                    adapters
-                        .iter()
-                        .map(|(_, a)| a)
-                        .filter(|a| a.get_info().name.to_lowercase().contains(&want))
-                        .collect()
-                }
-            },
-            None => adapters
-                .iter()
-                .map(|(_, a)| a)
-                .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
-                .collect(),
+        let adapter = match quick_adapter(options) {
+            Some(adapter) => adapter,
+            None => choose_adapter(options)?,
         };
-        // The best of the matching ones (the Vulkan one before the DX12 one).
-        candidates.sort_by_key(|a| rank(&a.get_info()));
-        let adapter = (*candidates.first().ok_or_else(|| {
-            Error::Other(format!(
-                "no GPU adapter matches {:?} on {backends:?}",
-                options.adapter.as_deref().unwrap_or("any")
-            ))
-        })?)
-        .clone();
         let info = adapter.get_info();
         let features = adapter.features() & wanted_features();
         if !features.contains(wgpu::Features::IMMEDIATES) {
@@ -339,8 +373,9 @@ impl Gpu {
 
     /// A persistent f16 buffer holding `data` (weights).
     pub fn upload_f16(&self, label: &str, data: &[f16]) -> Tensor {
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.tensor(label, Dtype::F16, data.len(), Some(&bytes))
+        // f16 is two little-endian bytes on every target wgpu runs on.
+        let bytes: &[u8] = bytemuck_f16(data);
+        self.tensor(label, Dtype::F16, data.len(), Some(bytes))
     }
 
     /// An f32 buffer of `len` values, zeroed.

@@ -15,9 +15,15 @@
 //!   and the frames past the first token are thrown away.
 //!
 //! Every product computes each output exactly as [`crate::cpu::dot`] does, whatever the
-//! batching, so none of this changes a single bit of a logit.
+//! batching, so none of this changes a single bit of a logit. That holds as well when a
+//! [`Team`] of threads shares a window's work: each step's products are cut by output rows (an
+//! LSTM layer by units, each part taking its units' rows of all four gates and computing their
+//! new state), and each output is still one whole dot product.
 
-use super::HParams;
+use super::{
+    HParams,
+    team::{Disjoint, Team, split},
+};
 use crate::{
     Error, Result, Token, Trace, Transcript, Word,
     cpu::{Linear, Mat, Weight, expand, products, relu, sigmoid},
@@ -83,27 +89,41 @@ impl Matrix {
         })
     }
 
-    /// `W·x` (without the bias) for each input row, into `out` (`rows` per input). Serial: at
-    /// the decoder's sizes, one window per thread is the parallelism that pays.
+    /// `W·x` (without the bias) for each input row, into `out` (`rows` per input), on this
+    /// thread.
     fn product(&self, xs: &[&[f32]], out: &mut [f32]) {
-        products(
-            xs,
-            self.weight.rows(0..self.rows, self.cols),
-            self.cols,
-            out,
-        );
+        self.rows_product(xs, 0..self.rows, out);
     }
 
-    /// `W·x + b` for each input row.
-    fn apply(&self, xs: &[&[f32]], out: &mut [f32]) {
-        self.product(xs, out);
-        if let Some(b) = &self.bias {
-            for row in out.chunks_exact_mut(self.rows) {
-                for (y, b) in row.iter_mut().zip(b) {
-                    *y += b;
+    /// Output rows `rows` of `W·x` for one input.
+    fn rows_product(&self, xs: &[&[f32]], rows: std::ops::Range<usize>, out: &mut [f32]) {
+        products(xs, self.weight.rows(rows, self.cols), self.cols, out);
+    }
+
+    /// `W·x + b` for each input row, into `out` (`rows` per input), the rows shared out
+    /// among `team`.
+    fn apply(&self, team: &Team, xs: &[&[f32]], out: &mut [f32]) {
+        let n = self.rows;
+        let parts = team.size();
+        let out = Disjoint::new(out);
+        team.run(&|part| {
+            let rows = split(n, parts, part, 8);
+            if rows.is_empty() {
+                return;
+            }
+            let mut ys = vec![0f32; xs.len() * rows.len()];
+            self.rows_product(xs, rows.clone(), &mut ys);
+            for (i, ys) in ys.chunks_exact(rows.len()).enumerate() {
+                // SAFETY: each part writes only its own rows of each input's outputs.
+                let out = unsafe { out.range(i * n + rows.start..i * n + rows.end) };
+                for (j, (o, y)) in out.iter_mut().zip(ys).enumerate() {
+                    *o = match &self.bias {
+                        Some(b) => y + b[rows.start + j],
+                        None => *y,
+                    };
                 }
             }
-        }
+        });
     }
 
     /// Row `r` as f32 (exact).
@@ -128,11 +148,12 @@ struct LstmLayer {
     bias: Vec<f32>,
 }
 
-/// The predictor's state: each layer's hidden and cell vectors.
+/// The predictor's state: each layer's hidden and cell vectors, layer after layer
+/// (`layers × hidden` each).
 #[derive(Clone)]
 struct State {
-    h: Vec<Vec<f32>>,
-    c: Vec<Vec<f32>>,
+    h: Vec<f32>,
+    c: Vec<f32>,
 }
 
 /// What the predictor steps on.
@@ -237,9 +258,16 @@ impl Decoder {
         self.joint_enc.forward(encoded)
     }
 
-    /// One predictor step from `state` on `input`. Checkpoints the first step as the reference
-    /// dumps it.
-    fn predict(&self, input: Input, state: &State, first: bool, trace: &mut dyn Trace) -> State {
+    /// One predictor step from `state` on `input`, shared out among `team` by units.
+    /// Checkpoints the first step as the reference dumps it.
+    fn predict(
+        &self,
+        input: Input,
+        state: &State,
+        first: bool,
+        trace: &mut dyn Trace,
+        team: &Team,
+    ) -> State {
         let h = self.hidden;
         let mut injected = None;
         if first {
@@ -258,56 +286,78 @@ impl Decoder {
             Some(x) => Input::Vector(x),
             None => input,
         };
+        let layers = self.lstm.len();
         let mut next = State {
-            h: Vec::with_capacity(self.lstm.len()),
-            c: Vec::with_capacity(self.lstm.len()),
+            h: vec![0.; layers * h],
+            c: vec![0.; layers * h],
         };
-        let mut from_input = vec![0.; 4 * h];
-        let mut gates = vec![0.; 4 * h];
+        let parts = team.size();
         for (l, layer) in self.lstm.iter().enumerate() {
-            // `W_x · x`: the table's row for a token, zeros (as the product of zeros is) at the
-            // start, else computed.
-            let x_product: &[f32] = match (l, &input) {
-                (0, Input::Start) => {
-                    from_input.fill(0.);
-                    &from_input
+            let (below, here) = next.h.split_at_mut(l * h);
+            let below: &[f32] = &below[below.len().saturating_sub(h)..];
+            let out_h = Disjoint::new(&mut here[..h]);
+            let out_c = Disjoint::new(&mut next.c[l * h..(l + 1) * h]);
+            let (h_prev, c_prev) = (&state.h[l * h..(l + 1) * h], &state.c[l * h..(l + 1) * h]);
+            let input = &input;
+            team.run(&|part| {
+                let units = split(h, parts, part, 8);
+                let n = units.len();
+                if n == 0 {
+                    return;
                 }
-                (0, Input::Token(t)) => &self.layer0_inputs[t * 4 * h..(t + 1) * 4 * h],
-                (0, Input::Vector(x)) => {
-                    layer.input.product(&[x], &mut from_input);
-                    &from_input
+                // This part's rows of each gate: `W_x · x` (the table's row for a token, zeros
+                // at the start, as the product of zeros is, else computed) and `W_h · h`.
+                let (mut xs, mut gs) = (vec![0f32; 4 * n], vec![0f32; 4 * n]);
+                for gate in 0..4 {
+                    let rows = gate * h + units.start..gate * h + units.end;
+                    let x = &mut xs[gate * n..(gate + 1) * n];
+                    match (l, input) {
+                        (0, Input::Start) => x.fill(0.),
+                        (0, Input::Token(t)) => {
+                            let row = &self.layer0_inputs[t * 4 * h..(t + 1) * 4 * h];
+                            x.copy_from_slice(&row[rows.clone()]);
+                        }
+                        (0, Input::Vector(v)) => layer.input.rows_product(&[v], rows.clone(), x),
+                        _ => layer.input.rows_product(&[below], rows.clone(), x),
+                    }
+                    let g = &mut gs[gate * n..(gate + 1) * n];
+                    layer.recurrent.rows_product(&[h_prev], rows, g);
                 }
-                _ => {
-                    layer.input.product(&[&next.h[l - 1]], &mut from_input);
-                    &from_input
+                // SAFETY: each part writes only its own units.
+                let (hl, cl) = unsafe { (out_h.range(units.clone()), out_c.range(units.clone())) };
+                for k in 0..n {
+                    let unit = units.start + k;
+                    // `(W_x·x + W_h·h) + b`, summed in the reference's order.
+                    let gate =
+                        |g: usize| (xs[g * n + k] + gs[g * n + k]) + layer.bias[g * h + unit];
+                    let i = sigmoid(gate(0));
+                    let f = sigmoid(gate(1));
+                    let g = gate(2).tanh();
+                    let o = sigmoid(gate(3));
+                    cl[k] = f * c_prev[unit] + i * g;
+                    hl[k] = o * cl[k].tanh();
                 }
-            };
-            layer.recurrent.product(&[&state.h[l]], &mut gates);
-            // `(W_x·x + W_h·h) + b`, summed in the reference's order.
-            for ((g, x), b) in gates.iter_mut().zip(x_product).zip(&layer.bias) {
-                *g = (x + *g) + b;
-            }
-            let (mut hl, mut cl) = (vec![0.; h], vec![0.; h]);
-            for k in 0..h {
-                let i = sigmoid(gates[k]);
-                let f = sigmoid(gates[h + k]);
-                let g = gates[2 * h + k].tanh();
-                let o = sigmoid(gates[3 * h + k]);
-                cl[k] = f * state.c[l][k] + i * g;
-                hl[k] = o * cl[k].tanh();
-            }
+            });
             if first {
+                let mut hl = next.h[l * h..(l + 1) * h].to_vec();
+                let mut cl = next.c[l * h..(l + 1) * h].to_vec();
                 checkpoint_vector(trace, &format!("dec.lstm.{l}.h.0"), &mut hl);
                 checkpoint_vector(trace, &format!("dec.lstm.{l}.c.0"), &mut cl);
+                next.h[l * h..(l + 1) * h].copy_from_slice(&hl);
+                next.c[l * h..(l + 1) * h].copy_from_slice(&cl);
             }
-            next.h.push(hl);
-            next.c.push(cl);
         }
         next
     }
 
+    /// The top layer's hidden state: the predictor's output.
+    fn output<'s>(&self, state: &'s State) -> &'s [f32] {
+        &state.h[state.h.len() - self.hidden..]
+    }
+
     /// The joint's logits for frames `start..start + n` of `enc_proj` with one predictor
     /// output (already projected): `out · relu(enc + pred) + b`, one row of logits per frame.
+    #[allow(clippy::too_many_arguments)]
     fn joint(
         &self,
         enc_proj: &Mat,
@@ -316,6 +366,7 @@ impl Decoder {
         pred: &[f32],
         hidden: &mut Vec<f32>,
         logits: &mut Vec<f32>,
+        team: &Team,
     ) {
         let width = self.joint_out.cols;
         hidden.resize(n * width, 0.);
@@ -326,29 +377,30 @@ impl Decoder {
         }
         let rows: Vec<&[f32]> = hidden.chunks_exact(width).collect();
         logits.resize(n * self.joint_out.rows, 0.);
-        self.joint_out.apply(&rows, logits);
+        self.joint_out.apply(team, &rows, logits);
     }
 
     /// Greedy RNN-T over `enc_proj` (frames × joint hidden, from [`project`](Self::project)):
     /// on each frame, emit the joint's best token and stay, until it says blank (or
     /// [`MAX_SYMBOLS_PER_FRAME`] tokens are out), then move to the next frame. The predictor
     /// only steps when a token is emitted, so its output is reused across blanks, and so are
-    /// the logits of frames evaluated ahead.
-    pub fn greedy(&self, enc_proj: &Mat, trace: &mut dyn Trace) -> Vec<Emitted> {
+    /// the logits of frames evaluated ahead. `team` shares out each step's work (one member:
+    /// all of it on this thread); the result is the same whatever its size.
+    pub fn greedy(&self, enc_proj: &Mat, trace: &mut dyn Trace, team: &Team) -> Vec<Emitted> {
         let frames = enc_proj.rows;
         let mut emitted = Vec::new();
         if frames == 0 {
             return emitted;
         }
-        let zeros = vec![0.; self.hidden];
+        let zeros = vec![0.; self.lstm.len() * self.hidden];
         let mut state = State {
-            h: vec![zeros.clone(); self.lstm.len()],
-            c: vec![zeros; self.lstm.len()],
+            h: zeros.clone(),
+            c: zeros,
         };
-        let mut next = self.predict(Input::Start, &state, true, trace);
+        let mut next = self.predict(Input::Start, &state, true, trace, team);
         let mut pred_proj = vec![0.; self.joint_pred.rows];
         self.joint_pred
-            .apply(&[next.h.last().unwrap()], &mut pred_proj);
+            .apply(team, &[self.output(&next)], &mut pred_proj);
         let vocab = self.joint_out.rows;
         // Logits of frames `ahead_start..ahead_start + ahead_len` for the current predictor
         // output, and how many frames the next evaluation takes.
@@ -364,7 +416,15 @@ impl Decoder {
             }
             if !(ahead_start..ahead_start + ahead_len).contains(&frame) {
                 let n = run.min(frames - frame);
-                self.joint(enc_proj, frame, n, &pred_proj, &mut hidden, &mut ahead);
+                self.joint(
+                    enc_proj,
+                    frame,
+                    n,
+                    &pred_proj,
+                    &mut hidden,
+                    &mut ahead,
+                    team,
+                );
                 (ahead_start, ahead_len) = (frame, n);
                 run = (2 * run).min(MAX_FRAMES_AHEAD);
             }
@@ -398,9 +458,9 @@ impl Decoder {
             );
             emitted.push(Emitted { token, frame, p });
             state = next;
-            next = self.predict(Input::Token(token), &state, false, trace);
+            next = self.predict(Input::Token(token), &state, false, trace, team);
             self.joint_pred
-                .apply(&[next.h.last().unwrap()], &mut pred_proj);
+                .apply(team, &[self.output(&next)], &mut pred_proj);
             // A new predictor output: the logits ahead are stale.
             (ahead_len, run) = (0, FRAMES_AHEAD_AFTER_TOKEN);
             symbols += 1;

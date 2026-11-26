@@ -9,14 +9,25 @@ mod decoder;
 pub mod encoder;
 pub mod gpu_encoder;
 mod pipeline;
+mod team;
 
 pub use pipeline::{CpuEncoder, EncoderStage, GpuStage};
 
 use crate::{
-    Error, ModelInfo, Result, RunOptions, Timings, Trace, Transcript, gguf::Gguf, mel::Mel,
-    tokenizer::Tokenizer, trace::checkpoint,
+    Error, ModelInfo, Result, RunOptions, Timings, Trace, Transcript, cpu::Mat, gguf::Gguf,
+    mel::Mel, tokenizer::Tokenizer, trace::checkpoint,
 };
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
+};
+use team::Team;
+
+/// The most threads one window's decoding is shared among. On the i5-13450HX (6 performance
+/// cores, 4 efficiency cores) a short window decodes 4× as fast on 6 as on one; on 8 it's
+/// slower again, the team then spanning a core's two hyperthreads or an efficiency core, whose
+/// pace every step waits for.
+const TEAM_SIZE: usize = 6;
 
 /// The model's shape, from its `stt.parakeet.*` metadata (all of it, whether the CPU path
 /// reads a field or not).
@@ -74,32 +85,50 @@ impl HParams {
 pub struct Parakeet {
     pub hparams: HParams,
     mel: Mel,
-    encoder: encoder::Encoder,
-    /// The encoder on the GPU, when the model runs on one. The CPU encoder stays loaded: it's
-    /// the oracle, and the fallback.
-    gpu: Option<(Arc<crate::gpu::Gpu>, gpu_encoder::GpuEncoder)>,
+    encoder: Encoder,
     decoder: decoder::Decoder,
     tokenizer: Tokenizer,
     pub info: ModelInfo,
+    /// The threads a pipeline makes mel features on (made at first use).
+    mel_pool: OnceLock<rayon::ThreadPool>,
+    /// Decoder teams kept between calls, their helpers parked.
+    teams: Mutex<Vec<Team>>,
+}
+
+/// Where the encoder runs. Only one is loaded: the GPU's needs nothing of the CPU's.
+// One per model: its size doesn't matter.
+#[allow(clippy::large_enum_variant)]
+enum Encoder {
+    Cpu(encoder::Encoder),
+    Gpu(Arc<crate::gpu::Gpu>, gpu_encoder::GpuEncoder),
 }
 
 impl Parakeet {
-    /// The model, with its encoder also on `gpu` when there's one.
+    /// The model, its encoder on `gpu` when there's one, else on the CPU.
     pub fn load(file: &Gguf, gpu: Option<Arc<crate::gpu::Gpu>>) -> Result<Parakeet> {
         let hparams = HParams::from_gguf(file)?;
-        let gpu = match gpu {
-            Some(gpu) => {
-                let encoder = gpu_encoder::GpuEncoder::load(&gpu, file, &hparams)?;
-                Some((gpu, encoder))
-            }
-            None => None,
+        // The decoder loads beside the encoder, off its critical path.
+        let (encoder, decoder) = rayon::join(
+            || -> Result<Encoder> {
+                Ok(match gpu {
+                    Some(gpu) => {
+                        let encoder = gpu_encoder::GpuEncoder::load(&gpu, file, &hparams)?;
+                        Encoder::Gpu(gpu, encoder)
+                    }
+                    None => Encoder::Cpu(encoder::Encoder::load(file, &hparams)?),
+                })
+            },
+            || decoder::Decoder::load(file, &hparams),
+        );
+        let encoder = encoder?;
+        let device = match &encoder {
+            Encoder::Cpu(_) => "CPU".into(),
+            Encoder::Gpu(gpu, _) => gpu.name(),
         };
-        let device = gpu.as_ref().map_or("CPU".into(), |(g, _)| g.name());
         Ok(Parakeet {
-            gpu,
+            encoder,
             mel: Mel::from_gguf(file)?,
-            encoder: encoder::Encoder::load(file, &hparams)?,
-            decoder: decoder::Decoder::load(file, &hparams)?,
+            decoder: decoder?,
             tokenizer: Tokenizer::from_gguf(file)?,
             info: ModelInfo {
                 architecture: "parakeet".into(),
@@ -107,10 +136,15 @@ impl Parakeet {
                 device,
             },
             hparams,
+            mel_pool: OnceLock::new(),
+            teams: Mutex::new(Vec::new()),
         })
     }
 
-    /// One window of 16 kHz audio to words.
+    /// One window of 16 kHz audio to words. Untraced, the encoder's frames come back already
+    /// projected into the joint's space (on a GPU, the projection is its last multiply), as
+    /// in [`run_all`](Self::run_all); a trace that records or substitutes checkpoints gets
+    /// the encoder's output itself, projected on the CPU.
     pub fn run(
         &self,
         pcm: &[f32],
@@ -122,27 +156,44 @@ impl Parakeet {
         let mel = self.features(pcm, trace);
         timings.mel_ms = start.elapsed().as_secs_f64() * 1e3;
         let start = Instant::now();
-        // Testing the decoder alone on the reference's encoder output needs no encoding.
-        let mut encoded = if trace.injects("enc.final") {
-            crate::cpu::Mat::zeros(0, self.hparams.d_model)
-        } else if let Some((_, gpu)) = &self.gpu {
-            gpu.encode_traced(std::slice::from_ref(&mel), trace)?
-                .remove(0)
+        let enc_proj = if self.traced(trace) {
+            // A trace sees (or substitutes) the encoder's own output, projected here. Testing
+            // the decoder alone on the reference's encoder output needs no encoding.
+            let mut encoded = if trace.injects("enc.final") {
+                Mat::zeros(0, self.hparams.d_model)
+            } else {
+                match &self.encoder {
+                    Encoder::Gpu(_, gpu) => gpu
+                        .encode_traced(std::slice::from_ref(&mel), trace)?
+                        .remove(0),
+                    Encoder::Cpu(cpu) => cpu.forward(&mel, trace),
+                }
+            };
+            checkpoint(trace, "enc.final", &mut encoded);
+            checkpoint(trace, "dec.enc_out", &mut encoded);
+            self.decoder.project(&encoded)
         } else {
-            self.encoder.forward(&mel, trace)
+            match &self.encoder {
+                // The projection is the GPU encoder's last multiply, as in the pipeline.
+                Encoder::Gpu(_, gpu) => gpu.encode_projected(std::slice::from_ref(&mel))?.remove(0),
+                Encoder::Cpu(cpu) => self.decoder.project(&cpu.forward(&mel, trace)),
+            }
         };
-        checkpoint(trace, "enc.final", &mut encoded);
         timings.encode_ms = start.elapsed().as_secs_f64() * 1e3;
         let start = Instant::now();
-        checkpoint(trace, "dec.enc_out", &mut encoded);
-        let enc_proj = self.decoder.project(&encoded);
-        let emitted = self.decoder.greedy(&enc_proj, trace);
-        let mut transcript = self
-            .decoder
-            .transcript(&emitted, &self.tokenizer, &self.hparams);
+        let team = self.take_team(TEAM_SIZE);
+        let mut transcript = self.decode(&enc_proj, trace, &team);
+        self.put_team(team);
         timings.decode_ms = start.elapsed().as_secs_f64() * 1e3;
         transcript.timings = timings;
         Ok(transcript)
+    }
+
+    /// A window's projected encoder frames to its transcript, `team` sharing the work.
+    fn decode(&self, enc_proj: &Mat, trace: &mut dyn Trace, team: &Team) -> Transcript {
+        let emitted = self.decoder.greedy(enc_proj, trace, team);
+        self.decoder
+            .transcript(&emitted, &self.tokenizer, &self.hparams)
     }
 
     /// Every window of a recording, in order, each with exactly the result [`run`](Self::run)
@@ -155,21 +206,22 @@ impl Parakeet {
         options: &RunOptions,
         trace: &mut dyn Trace,
     ) -> Result<Vec<Transcript>> {
-        if self.traced(trace) {
+        // One window has nothing to overlap: it runs as `run` runs it.
+        if self.traced(trace) || windows.len() == 1 {
             return windows
                 .iter()
                 .map(|pcm| self.run(pcm, options, trace))
                 .collect();
         }
-        match &self.gpu {
-            Some((_, encoder)) => self.pipeline(
+        match &self.encoder {
+            Encoder::Gpu(_, encoder) => self.pipeline(windows, &mut GpuStage::new(encoder)),
+            Encoder::Cpu(encoder) => self.pipeline(
                 windows,
-                &mut GpuStage {
+                &mut CpuEncoder {
                     model: self,
                     encoder,
                 },
             ),
-            None => self.pipeline(windows, &mut CpuEncoder { model: self }),
         }
     }
 
@@ -196,12 +248,12 @@ impl Parakeet {
 
     /// A window's mel features as the encoder takes them (`num_mels` × frames). The last frame
     /// is the centering pad's: the reference dumps it (`enc.mel.in`) but encodes without it.
-    pub fn features(&self, pcm: &[f32], trace: &mut dyn Trace) -> crate::cpu::Mat {
+    pub fn features(&self, pcm: &[f32], trace: &mut dyn Trace) -> Mat {
         let mut mel = self.mel.compute(pcm);
         checkpoint(trace, "enc.mel.in", &mut mel);
         let valid = self.mel.valid_frames(pcm.len()).min(mel.cols);
         if valid < mel.cols {
-            let mut trimmed = crate::cpu::Mat::zeros(mel.rows, valid);
+            let mut trimmed = Mat::zeros(mel.rows, valid);
             for r in 0..mel.rows {
                 trimmed.row_mut(r).copy_from_slice(&mel.row(r)[..valid]);
             }

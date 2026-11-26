@@ -18,6 +18,27 @@ transcribe.cpp on the RTX 4060 Laptop GPU, over 17.9 hours of audio (`cargo lab 
 The stages run one after another, one window at a time. A 2.2 s clip takes 42 ms: a fixed cost of
 roughly 15–35 ms per call. The encoder reaches about 5 TFLOP/s.
 
+## Where we are
+
+RTX 4060 Laptop GPU, quick tier, paired against the reference (`cargo lab bench --tier quick
+--models parakeet --a ref --b vellum`): median speedup 3.17× (95% interval 2.97–4.65); the
+18-minute earnings call in 1.20 s (911× real time, the reference 6.96 s); 2–5 s clips in 13–18 ms
+(the reference 34–49 ms); model ready in 0.87–0.95 s (0.83 s); peak memory 1.0 GB (0.8 GB). 524 of
+527 clips give the reference's transcript, with equal WER. Long recordings are now bound by the GPU
+encoder alone (about 26 ms per 28 s window in batches of 8, back to back); short ones by its
+fixed ~11.5 ms per call (streaming 1.25 GB of f16 weights at low occupancy).
+
+Learned on the way:
+
+- Windows 11 power-throttles a background process onto efficiency cores at low clocks (decoding
+  7× slower). The engine opts its process out when it loads a model (`keep_full_speed`); the
+  reference measures the same either way.
+- The encoder stage keeps two batches in flight (`submit` returns the batch before), and batches
+  shrink toward the end of a recording (…8, 5, 2, 1) so the last windows' decoding overlaps too.
+- A single window (short clips, a recording's tail) decodes on a team of up to 6 threads that
+  split each LSTM step and joint evaluation by rows (`parakeet/team.rs`), bit-identical to one
+  thread and 4× faster; the CPU budget is fixed (4 mel threads, 1 GPU feeder, the rest decoders).
+
 ## The execution model
 
 1. **A recording at a time.** The harness hands the engine every window of a recording at once

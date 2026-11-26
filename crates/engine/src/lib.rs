@@ -141,6 +141,54 @@ fn gpu(device: Device) -> Result<Option<std::sync::Arc<gpu::Gpu>>> {
     }
 }
 
+/// Asks Windows not to slow this process down while it isn't in the foreground. Windows 11
+/// otherwise moves a background process's threads to efficiency cores at low clocks ("EcoQoS"
+/// power throttling) whenever it sees fit: measured in the lab, an 18-minute recording then
+/// took 2.5 s instead of 1.2 s, its decoding seven times as long. A transcription the user
+/// asked for is foreground work even when its window is not.
+#[cfg(windows)]
+fn keep_full_speed() {
+    use std::ffi::c_void;
+    /// `PROCESS_POWER_THROTTLING_STATE`.
+    #[repr(C)]
+    struct PowerThrottling {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn SetProcessInformation(
+            process: *mut c_void,
+            class: i32,
+            information: *const c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const PROCESS_POWER_THROTTLING: i32 = 4;
+    const EXECUTION_SPEED: u32 = 1;
+    // Control the execution-speed throttling, and turn it off.
+    let state = PowerThrottling {
+        version: 1,
+        control_mask: EXECUTION_SPEED,
+        state_mask: 0,
+    };
+    // SAFETY: the pseudo-handle of this process and a valid state of the size given. A
+    // failure (an older Windows) changes nothing, so its result isn't needed.
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            PROCESS_POWER_THROTTLING,
+            (&raw const state).cast(),
+            size_of::<PowerThrottling>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn keep_full_speed() {}
+
 /// A speech model, loaded.
 pub struct Transcriber {
     model: SpeechModel,
@@ -152,6 +200,7 @@ enum SpeechModel {
 
 impl Transcriber {
     pub fn load(path: &Path, options: &Options) -> Result<Self> {
+        keep_full_speed();
         let (file, arch) = architecture(path)?;
         let model = match arch.as_str() {
             "parakeet" => {

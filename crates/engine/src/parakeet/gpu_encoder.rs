@@ -68,10 +68,12 @@ impl Default for GpuEncoderOptions {
     }
 }
 
-/// The tile shapes that measure best on an RTX 4060 (`cargo lab kernels`).
+/// The tile shapes that measure best on an RTX 4060 (`cargo lab kernels`). K steps of 64
+/// rather than 32 make no difference to a long recording and take a short window's encoding
+/// from 13.5 to 11.5 ms (it's bound by streaming the weights, at any length).
 fn default_variant(gpu: &Gpu) -> Variant {
     let (kind, bm, bn, bk, tm, tn) = if gpu.has_f16_tensor_cores() {
-        (Kind::Coop, 64, 128, 32, 32, 64)
+        (Kind::Coop, 64, 128, 64, 32, 64)
     } else {
         (Kind::Simt, 128, 64, 16, 8, 4)
     };
@@ -179,6 +181,9 @@ pub struct GpuEncoder {
     kernels: Kernels,
     pre: PreEncode,
     blocks: Vec<Block>,
+    /// The joint network's encoder projection (`joint.enc`, d_model → joint hidden), applied
+    /// to the last block's output on the fast path, so only its narrower result comes back.
+    joint: Weights,
     buffers: Mutex<Buffers>,
     /// Mapped-readback buffers for the batches in flight (two: one being encoded while the
     /// last one's result is read).
@@ -194,6 +199,17 @@ pub struct Pending {
     staging: wgpu::Buffer,
     windows: Vec<Window>,
     submission: wgpu::SubmissionIndex,
+    /// Values per row of the result: d_model, or the joint's width when projected.
+    width: usize,
+}
+
+/// What a batch reads back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Output {
+    /// The encoder states (`enc.final`).
+    Encoded,
+    /// The encoder states through the joint's encoder projection.
+    Projected,
 }
 
 /// One window of a batch: where its mel and its rows are.
@@ -309,10 +325,9 @@ impl GpuEncoder {
             .into_par_iter()
             .map(|l| -> Result<(Block, Weights)> {
                 let name = format!("enc.blocks.{l}");
-                let linear_pos = Linear::load(file, &format!("{name}.attn.linear_pos"))?;
                 Ok((
                     load_block(gpu, file, &name, &dims)?,
-                    Weights::upload(gpu, "linear_pos", &linear_pos),
+                    upload_linear(gpu, file, &format!("{name}.attn.linear_pos"), "linear_pos")?,
                 ))
             })
             .collect::<Result<_>>()?;
@@ -341,6 +356,13 @@ impl GpuEncoder {
         // needed again.
         gpu.clear_bind_groups();
 
+        let joint = upload_linear(gpu, file, "joint.enc", "joint.enc")?;
+        if joint.k != dims.d_model || joint.n > dims.d_model {
+            return Err(Error::Gguf(format!(
+                "joint.enc is {}×{}, for an encoder of {}",
+                joint.n, joint.k, dims.d_model
+            )));
+        }
         let rows = dims.max_batch * dims.max_frames;
         let pre_points = halve(halve(dims.max_mel_frames)) * halve(halve(dims.mels));
         let scores = dims.max_batch * dims.heads * dims.max_frames * dims.max_frames;
@@ -390,6 +412,7 @@ impl GpuEncoder {
             kernels,
             pre,
             blocks,
+            joint,
             buffers: Mutex::new(buffers),
             staging: Mutex::new(staging),
         })
@@ -432,13 +455,47 @@ impl GpuEncoder {
     /// Records and submits one batch (at most [`max_batch`](Self::max_batch) windows) without
     /// waiting for it. At most two can be pending at once.
     pub fn submit(&self, mels: &[Mat]) -> Result<Pending> {
+        self.submit_as(mels, Output::Encoded)
+    }
+
+    /// [`submit`](Self::submit), the result being each window's frames through the joint's
+    /// encoder projection (⌈frames / 8⌉ × joint hidden): all the decoder needs of the encoder.
+    pub fn submit_projected(&self, mels: &[Mat]) -> Result<Pending> {
+        self.submit_as(mels, Output::Projected)
+    }
+
+    /// [`encode`](Self::encode), projected as [`submit_projected`](Self::submit_projected)
+    /// projects.
+    pub fn encode_projected(&self, mels: &[Mat]) -> Result<Vec<Mat>> {
+        let mut out = Vec::with_capacity(mels.len());
+        for batch in mels.chunks(self.dims.max_batch) {
+            out.extend(self.finish(self.submit_projected(batch)?)?);
+        }
+        Ok(out)
+    }
+
+    fn submit_as(&self, mels: &[Mat], output: Output) -> Result<Pending> {
         self.check_batch(mels)?;
         let staging = self.take_staging()?;
-        match self.record(mels, None, Timing::None, &staging) {
+        let r = self.record(mels, None, Timing::None, output, &staging);
+        self.pending(staging, r, output)
+    }
+
+    fn pending(
+        &self,
+        staging: wgpu::Buffer,
+        recorded: Result<(Vec<Window>, wgpu::SubmissionIndex)>,
+        output: Output,
+    ) -> Result<Pending> {
+        match recorded {
             Ok((windows, submission)) => Ok(Pending {
                 staging,
                 windows,
                 submission,
+                width: match output {
+                    Output::Encoded => self.dims.d_model,
+                    Output::Projected => self.joint.n,
+                },
             }),
             Err(e) => {
                 self.staging.lock().unwrap().push(staging);
@@ -453,21 +510,25 @@ impl GpuEncoder {
             staging,
             windows,
             submission,
+            width,
         } = pending;
-        let d = self.dims.d_model;
         let rows: usize = windows.iter().map(|w| w.frames).sum();
-        let data = map_read(&self.gpu, &staging, (rows * d * 4) as u64, Some(submission));
+        let spans: Vec<(usize, usize)> = windows
+            .iter()
+            .map(|w| (w.start * width, w.frames * width))
+            .collect();
+        let data = map_read(
+            &self.gpu,
+            &staging,
+            (rows * width * 4) as u64,
+            Some(submission),
+            &spans,
+        );
         self.staging.lock().unwrap().push(staging);
-        let data = data?;
         Ok(windows
             .iter()
-            .map(|w| {
-                Mat::from_vec(
-                    w.frames,
-                    d,
-                    data[w.start * d..(w.start + w.frames) * d].to_vec(),
-                )
-            })
+            .zip(data?)
+            .map(|(w, data)| Mat::from_vec(w.frames, width, data))
             .collect())
     }
 
@@ -485,26 +546,8 @@ impl GpuEncoder {
     pub fn encode_traced(&self, mels: &[Mat], trace: &mut dyn Trace) -> Result<Vec<Mat>> {
         self.check_batch(mels)?;
         let staging = self.take_staging()?;
-        let recorded = self.record(mels, Some(trace), Timing::None, &staging);
-        self.finish_recorded(staging, recorded)
-    }
-
-    fn finish_recorded(
-        &self,
-        staging: wgpu::Buffer,
-        recorded: Result<(Vec<Window>, wgpu::SubmissionIndex)>,
-    ) -> Result<Vec<Mat>> {
-        match recorded {
-            Ok((windows, submission)) => self.finish(Pending {
-                staging,
-                windows,
-                submission,
-            }),
-            Err(e) => {
-                self.staging.lock().unwrap().push(staging);
-                Err(e)
-            }
-        }
+        let recorded = self.record(mels, Some(trace), Timing::None, Output::Encoded, &staging);
+        self.finish(self.pending(staging, recorded, Output::Encoded)?)
     }
 
     /// [`encode`](Self::encode) of one batch with GPU timestamps: per submit (`per_dispatch`
@@ -524,8 +567,8 @@ impl GpuEncoder {
             Timing::Passes(&mut profiler)
         };
         let staging = self.take_staging()?;
-        let recorded = self.record(mels, None, timing, &staging);
-        let out = self.finish_recorded(staging, recorded)?;
+        let recorded = self.record(mels, None, timing, Output::Encoded, &staging);
+        let out = self.finish(self.pending(staging, recorded, Output::Encoded)?)?;
         let times = profiler.read(&self.gpu)?;
         Ok((out, times))
     }
@@ -541,13 +584,14 @@ impl GpuEncoder {
         Ok(())
     }
 
-    /// Records and submits one batch, its output copied into `staging`; returns the windows
+    /// Records and submits one batch, its `output` copied into `staging`; returns the windows
     /// and the last submission.
     fn record(
         &self,
         mels: &[Mat],
         mut trace: Option<&mut dyn Trace>,
         timing: Timing,
+        output: Output,
         staging: &wgpu::Buffer,
     ) -> Result<(Vec<Window>, wgpu::SubmissionIndex)> {
         let d = self.dims;
@@ -773,7 +817,22 @@ impl GpuEncoder {
         }
 
         let out = &b.residual[self.blocks.len() % 2];
-        rec.copy(out, 0, staging, 0, (rows * d.d_model * 4) as u64);
+        match output {
+            Output::Encoded => rec.copy(out, 0, staging, 0, (rows * d.d_model * 4) as u64),
+            Output::Projected => {
+                // Into `normed`, free once the last block's layer norm has run.
+                self.gemm(
+                    &mut rec,
+                    "gemm/joint.enc",
+                    out,
+                    &self.joint,
+                    &b.normed,
+                    rows,
+                    Epilogue::default(),
+                );
+                rec.copy(&b.normed, 0, staging, 0, (rows * self.joint.n * 4) as u64);
+            }
+        }
         let submission = rec
             .submit()
             .ok_or_else(|| Error::Other("nothing recorded".into()))?;
@@ -928,11 +987,8 @@ impl GpuEncoder {
         let bytes = (w.frames * d * 4) as u64;
         rec.copy(t, (w.start * d * 4) as u64, staging, 0, bytes);
         let submission = rec.submit();
-        Ok(Mat::from_vec(
-            w.frames,
-            d,
-            map_read(&self.gpu, staging, bytes, submission)?,
-        ))
+        let data = map_read(&self.gpu, staging, bytes, submission, &[(0, w.frames * d)])?;
+        Ok(Mat::from_vec(w.frames, d, data.into_iter().next().unwrap()))
     }
 }
 
@@ -1009,20 +1065,12 @@ fn load_block(gpu: &Gpu, file: &Gguf, name: &str, d: &Dims) -> Result<Block> {
             bias: gpu.upload_f32(n, &vector(file, &format!("{name}.{n}.bias"))?),
         })
     };
-    let linear = |n: &str| -> Result<Weights> {
-        Ok(Weights::upload(
-            gpu,
-            n,
-            &Linear::load(file, &format!("{name}.{n}"))?,
-        ))
-    };
+    let linear = |n: &str| upload_linear(gpu, file, &format!("{name}.{n}"), n);
     let qkv = stacked(
         gpu,
+        file,
         "attn.qkv",
-        &["q", "k", "v"]
-            .iter()
-            .map(|p| Linear::load(file, &format!("{name}.attn.linear_{p}")))
-            .collect::<Result<Vec<_>>>()?,
+        &["q", "k", "v"].map(|p| format!("{name}.attn.linear_{p}")),
     )?;
 
     // Batch norm folded into the depthwise convolution: `scale = γ / √(var + ε)`, weights
@@ -1084,30 +1132,155 @@ fn load_block(gpu: &Gpu, file: &Gguf, name: &str, d: &Dims) -> Result<Block> {
 }
 
 /// Layers with the same inputs as one: their output rows (and biases) one after another.
-fn stacked(gpu: &Gpu, label: &str, layers: &[Linear]) -> Result<Weights> {
-    let k = layers[0].cols;
+fn stacked(gpu: &Gpu, file: &Gguf, label: &str, names: &[String]) -> Result<Weights> {
     let mut weight = Vec::new();
     let mut bias = Vec::new();
-    let mut inexact = 0;
-    for l in layers {
-        if l.cols != k {
+    let (mut k, mut inexact) = (None, 0);
+    for name in names {
+        let layer = F16Linear::load(file, name)?;
+        if *k.get_or_insert(layer.cols) != layer.cols {
             return Err(Error::Gguf(format!("{label}: layers of different widths")));
         }
-        let (w, n) = gemm::to_f16(l);
-        weight.extend(w);
-        inexact += n;
-        match &l.bias {
-            Some(b) => bias.extend_from_slice(b),
-            None => bias.extend(std::iter::repeat_n(0., l.rows)),
+        weight.extend(layer.weight);
+        inexact += layer.inexact;
+        match layer.bias {
+            Some(b) => bias.extend(b),
+            None => bias.extend(std::iter::repeat_n(0., layer.rows)),
         }
     }
     Ok(Weights {
         n: bias.len(),
-        k,
+        k: k.unwrap_or(0),
         weight: gpu.upload_f16(label, &weight),
         bias: Some(gpu.upload_f32(label, &bias)),
         inexact,
     })
+}
+
+/// A linear layer `name` (its `.weight` and any `.bias`) uploaded for [`Gemm`].
+fn upload_linear(gpu: &Gpu, file: &Gguf, name: &str, label: &str) -> Result<Weights> {
+    let layer = F16Linear::load(file, name)?;
+    Ok(Weights {
+        n: layer.rows,
+        k: layer.cols,
+        weight: gpu.upload_f16(label, &layer.weight),
+        bias: layer.bias.map(|b| gpu.upload_f32(label, &b)),
+        inexact: layer.inexact,
+    })
+}
+
+/// A linear layer's weight as the GPU takes it: `rows × cols` row-major f16, exactly what
+/// [`gemm::to_f16`] makes of the CPU's [`Linear`] (each value rounded to the nearest f16), but
+/// converted straight from the file's Q8_0 blocks, eight values at a time where the CPU
+/// converts in hardware: it's most of the model's load time otherwise.
+struct F16Linear {
+    rows: usize,
+    cols: usize,
+    weight: Vec<f16>,
+    bias: Option<Vec<f32>>,
+    /// Values f16 couldn't hold exactly.
+    inexact: usize,
+}
+
+impl F16Linear {
+    fn load(file: &Gguf, name: &str) -> Result<F16Linear> {
+        let info = crate::cpu::tensor(file, &format!("{name}.weight"))?;
+        // As `Linear::load` reads shapes: a leading kernel dimension of one isn't an input.
+        let mut dims: Vec<usize> = info.dims.iter().map(|d| *d as usize).collect();
+        while dims.len() > 2 && dims[0] == 1 {
+            dims.remove(0);
+        }
+        let cols = dims[0];
+        let rows: usize = dims[1..].iter().product();
+        if info.dtype != crate::gguf::Dtype::Q8_0 || !cols.is_multiple_of(32) {
+            let linear = Linear::load(file, name)?;
+            let (weight, inexact) = gemm::to_f16(&linear);
+            return Ok(F16Linear {
+                rows,
+                cols,
+                weight,
+                bias: linear.bias,
+                inexact,
+            });
+        }
+        let blocks = file.data(info).as_chunks::<34>().0;
+        if blocks.len() * 32 != rows * cols {
+            return Err(Error::Gguf(format!(
+                "{name}.weight: {} blocks",
+                blocks.len()
+            )));
+        }
+        let mut weight = vec![f16::ZERO; rows * cols];
+        // Chunks of whole blocks, one task each.
+        const PER_TASK: usize = 2048;
+        let inexact = weight
+            .par_chunks_mut(32 * PER_TASK)
+            .zip(blocks.par_chunks(PER_TASK))
+            .map(|(out, blocks)| q8_to_f16(blocks, out))
+            .sum();
+        let bias = match file.tensor(&format!("{name}.bias")) {
+            Some(b) => Some(file.dequantize(b)?),
+            None => None,
+        };
+        if bias.as_ref().is_some_and(|b| b.len() != rows) {
+            return Err(Error::Gguf(format!("{name}.bias: not {rows} values")));
+        }
+        Ok(F16Linear {
+            rows,
+            cols,
+            weight,
+            bias,
+            inexact,
+        })
+    }
+}
+
+/// Q8_0 blocks (an f16 scale, 32 int8s) to f16 `scale · q`, rounded to nearest (the product is
+/// exact in f32); returns how many rounded.
+fn q8_to_f16(blocks: &[[u8; 34]], out: &mut [f16]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("f16c") && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU has the features; `out` holds 32 values per block.
+        return unsafe { q8_to_f16_f16c(blocks, out) };
+    }
+    let mut inexact = 0;
+    for (b, out) in blocks.iter().zip(out.as_chunks_mut::<32>().0) {
+        let scale = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        for (o, &q) in out.iter_mut().zip(&b[2..]) {
+            let v = scale * q as i8 as f32;
+            *o = f16::from_f32(v);
+            inexact += usize::from(o.to_f32() != v);
+        }
+    }
+    inexact
+}
+
+/// [`q8_to_f16`] with F16C: the same rounding (to nearest, ties to even), eight at a time.
+///
+/// # Safety
+/// The CPU has AVX2 and F16C, and `out` holds 32 values per block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn q8_to_f16_f16c(blocks: &[[u8; 34]], out: &mut [f16]) -> usize {
+    use std::arch::x86_64::*;
+    assert!(out.len() >= 32 * blocks.len());
+    let mut inexact = 0;
+    for (b, out) in blocks.iter().zip(out.as_chunks_mut::<32>().0) {
+        let scale = _mm256_set1_ps(f16::from_le_bytes([b[0], b[1]]).to_f32());
+        for part in 0..4 {
+            // SAFETY: bytes 2 + 8·part .. + 8 are in the block; `out` has 8 values there.
+            unsafe {
+                let q = _mm_loadl_epi64(b.as_ptr().add(2 + 8 * part).cast());
+                let v = _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q)));
+                let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
+                _mm_storeu_si128(out.as_mut_ptr().add(8 * part).cast(), h);
+                let back = _mm256_cvtph_ps(h);
+                let differ = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_NEQ_UQ>(back, v));
+                inexact += differ.count_ones() as usize;
+            }
+        }
+    }
+    inexact
 }
 
 /// The sinusoidal encodings of offsets `frames − 1` (row 0) down to `−(frames − 1)`, exactly
@@ -1137,14 +1310,15 @@ fn f32_bytes(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
 }
 
-/// Waits for `submission` (or everything submitted), then reads the first `bytes` of a
-/// mappable buffer as f32s.
+/// Waits for `submission` (or everything submitted), then reads spans (`(first value,
+/// values)`) of the first `bytes` of a mappable buffer as f32s, each its own vector.
 fn map_read(
     gpu: &Gpu,
     buffer: &wgpu::Buffer,
     bytes: u64,
     submission: Option<wgpu::SubmissionIndex>,
-) -> Result<Vec<f32>> {
+    spans: &[(usize, usize)],
+) -> Result<Vec<Vec<f32>>> {
     let slice = buffer.slice(..bytes);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| drop(tx.send(r)));
@@ -1157,17 +1331,21 @@ fn map_read(
     rx.recv()
         .map_err(|_| Error::Other("readback never mapped".into()))?
         .map_err(|e| Error::Other(format!("readback: {e}")))?;
-    let mut data = vec![0f32; bytes as usize / 4];
-    {
+    let data = {
         let view = slice
             .get_mapped_range()
             .map_err(|e| Error::Other(format!("readback: {e}")))?;
-        // SAFETY: as in `f32_bytes`: the vector's memory as bytes, exactly `bytes` long.
-        let out = unsafe {
-            std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), bytes as usize)
-        };
-        out.copy_from_slice(&view);
-    }
+        spans
+            .iter()
+            .map(|&(first, len)| {
+                let mut out = vec![0f32; len];
+                // SAFETY: as in `f32_bytes`: the vector's memory as bytes, exactly as long.
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len * 4) }
+                    .copy_from_slice(&view[first * 4..(first + len) * 4]);
+                out
+            })
+            .collect()
+    };
     buffer.unmap();
     Ok(data)
 }
