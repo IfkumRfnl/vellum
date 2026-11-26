@@ -143,7 +143,7 @@ impl Parakeet {
 
     /// One window of 16 kHz audio to words. Untraced, the encoder's frames come back already
     /// projected into the joint's space (on a GPU, the projection is its last multiply), as
-    /// in [`run_all`](Self::run_all); a trace that records or substitutes checkpoints gets
+    /// in [`run_each`](Self::run_each); a trace that records or substitutes checkpoints gets
     /// the encoder's output itself, projected on the CPU.
     pub fn run(
         &self,
@@ -198,30 +198,49 @@ impl Parakeet {
 
     /// Every window of a recording, in order, each with exactly the result [`run`](Self::run)
     /// gives it, but with mel, encoder and decoder working on different windows at once (see
-    /// [`pipeline`](Self::pipeline)). A trace that records or substitutes tensors gets the
-    /// windows one by one instead, so its checkpoints keep their meaning.
-    pub fn run_all(
+    /// [`pipeline`](Self::pipeline)); each handed to `each` as soon as it and the windows
+    /// before it are done. `stop` is polled between windows and batches. A trace that records
+    /// or substitutes tensors gets the windows one by one instead, so its checkpoints keep
+    /// their meaning.
+    pub fn run_each(
         &self,
         windows: &[&[f32]],
         options: &RunOptions,
         trace: &mut dyn Trace,
-    ) -> Result<Vec<Transcript>> {
+        stop: &(dyn Fn() -> bool + Sync),
+        each: &mut dyn FnMut(usize, Transcript) -> Result<()>,
+    ) -> Result<()> {
         // One window has nothing to overlap: it runs as `run` runs it.
         if self.traced(trace) || windows.len() == 1 {
-            return windows
-                .iter()
-                .map(|pcm| self.run(pcm, options, trace))
-                .collect();
+            for (index, pcm) in windows.iter().enumerate() {
+                if stop() {
+                    return Err(Error::Cancelled);
+                }
+                each(index, self.run(pcm, options, trace)?)?;
+            }
+            return Ok(());
         }
         match &self.encoder {
-            Encoder::Gpu(_, encoder) => self.pipeline(windows, &mut GpuStage::new(encoder)),
+            Encoder::Gpu(_, encoder) => {
+                self.pipeline(windows, &mut GpuStage::new(encoder), stop, each)
+            }
             Encoder::Cpu(encoder) => self.pipeline(
                 windows,
                 &mut CpuEncoder {
                     model: self,
                     encoder,
                 },
+                stop,
+                each,
             ),
+        }
+    }
+
+    /// The GPU the encoder runs on, if it runs on one.
+    pub fn gpu(&self) -> Option<&crate::gpu::Gpu> {
+        match &self.encoder {
+            Encoder::Gpu(gpu, _) => Some(gpu),
+            Encoder::Cpu(_) => None,
         }
     }
 

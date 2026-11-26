@@ -14,7 +14,7 @@
 //! kernel. Buffers and bind groups are made once; shapes are immediates; no pipeline depends
 //! on a window's length or the batch size.
 
-mod record;
+pub(crate) mod record;
 
 use super::HParams;
 use crate::{
@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 const PRE_CONV: &str = include_str!("gpu_encoder/pre_conv.wgsl");
 const DEPTHWISE2D: &str = include_str!("gpu_encoder/depthwise2d.wgsl");
-const LAYER_NORM: &str = include_str!("gpu_encoder/layer_norm.wgsl");
+pub(crate) const LAYER_NORM: &str = include_str!("gpu_encoder/layer_norm.wgsl");
 const SCORES: &str = include_str!("gpu_encoder/scores.wgsl");
 const ATTEND: &str = include_str!("gpu_encoder/attend.wgsl");
 const CONV_MODULE: &str = include_str!("gpu_encoder/conv_module.wgsl");
@@ -54,6 +54,9 @@ pub struct GpuEncoderOptions {
     /// Work per submit, in rows × blocks: a submit goes out once this much is recorded, so
     /// no single one runs long (about 15 ms on an RTX 4060, well under a second on an iGPU).
     pub rows_per_submit: usize,
+    /// The most encoder frames a window can have, when it's more than the longest mel window
+    /// subsampled: Sortformer encodes its speaker cache and newest chunk together.
+    pub max_frames: Option<usize>,
 }
 
 impl Default for GpuEncoderOptions {
@@ -64,6 +67,7 @@ impl Default for GpuEncoderOptions {
             // 30.72 s: the engine takes windows up to 30 s (and one centering frame).
             max_mel_frames: 3072,
             rows_per_submit: 6000,
+            max_frames: None,
         }
     }
 }
@@ -182,8 +186,9 @@ pub struct GpuEncoder {
     pre: PreEncode,
     blocks: Vec<Block>,
     /// The joint network's encoder projection (`joint.enc`, d_model → joint hidden), applied
-    /// to the last block's output on the fast path, so only its narrower result comes back.
-    joint: Weights,
+    /// to the last block's output on the fast path, so only its narrower result comes back
+    /// (Parakeet's; a model without one has none).
+    joint: Option<Weights>,
     buffers: Mutex<Buffers>,
     /// Mapped-readback buffers for the batches in flight (two: one being encoded while the
     /// last one's result is read).
@@ -204,12 +209,33 @@ pub struct Pending {
 }
 
 /// What a batch reads back.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Output {
+#[derive(Clone, Copy)]
+enum Output<'a> {
     /// The encoder states (`enc.final`).
     Encoded,
     /// The encoder states through the joint's encoder projection.
     Projected,
+    /// The subsampling's output (`enc.pre_encode.out`, before the x-scaling); no blocks run.
+    PreEncoded,
+    /// Whatever a [`Tail`] makes of the encoder states.
+    Tail(&'a dyn Tail),
+}
+
+/// What a batch is made of.
+#[derive(Clone, Copy)]
+enum Input<'a> {
+    /// Each window's mel features.
+    Mels(&'a [Mat]),
+    /// One window already subsampled and x-scaled: frames × d_model.
+    Rows(&'a Mat),
+}
+
+/// Layers that run on the GPU after the encoder's last block, in the same submission, their
+/// result being what's read back: Sortformer's transformer and speaker head.
+pub(crate) trait Tail {
+    /// Records the layers on the first `rows` rows of `x` (d_model wide) and copies their
+    /// result into the start of `staging`; returns its width per row.
+    fn record(&self, rec: &mut Recorder, x: &Tensor, rows: usize, staging: &wgpu::Buffer) -> usize;
 }
 
 /// One window of a batch: where its mel and its rows are.
@@ -236,7 +262,8 @@ impl GpuEncoder {
             .metadata_u64("stt.frontend.num_mels")
             .ok_or_else(|| Error::Gguf("no stt.frontend.num_mels".into()))?
             as usize;
-        let max_frames = halve(halve(halve(options.max_mel_frames)));
+        let max_frames =
+            halve(halve(halve(options.max_mel_frames))).max(options.max_frames.unwrap_or(0));
         let dims = Dims {
             d_model: hparams.d_model,
             heads: hparams.n_heads,
@@ -250,10 +277,12 @@ impl GpuEncoder {
             max_batch: options.max_batch.max(1),
         };
         let d_head = dims.d_model / dims.heads.max(1);
+        // Layer norms take any width; the convolution module needs a multiple of 256 channels,
+        // the attention heads 64 features or a multiple of 128.
         if hparams.subsampling_factor != 8
-            || !dims.d_model.is_multiple_of(1024)
+            || !dims.d_model.is_multiple_of(256)
             || dims.heads * d_head != dims.d_model
-            || !d_head.is_multiple_of(128)
+            || !(d_head == 64 || d_head.is_multiple_of(128))
             || !dims.channels.is_multiple_of(16)
             || dims.kernel.is_multiple_of(2)
         {
@@ -356,8 +385,13 @@ impl GpuEncoder {
         // needed again.
         gpu.clear_bind_groups();
 
-        let joint = upload_linear(gpu, file, "joint.enc", "joint.enc")?;
-        if joint.k != dims.d_model || joint.n > dims.d_model {
+        let joint = match file.tensor("joint.enc.weight") {
+            Some(_) => Some(upload_linear(gpu, file, "joint.enc", "joint.enc")?),
+            None => None,
+        };
+        if let Some(joint) = &joint
+            && (joint.k != dims.d_model || joint.n > dims.d_model)
+        {
             return Err(Error::Gguf(format!(
                 "joint.enc is {}×{}, for an encoder of {}",
                 joint.n, joint.k, dims.d_model
@@ -476,26 +510,56 @@ impl GpuEncoder {
 
     fn submit_as(&self, mels: &[Mat], output: Output) -> Result<Pending> {
         self.check_batch(mels)?;
+        if matches!(output, Output::Projected) && self.joint.is_none() {
+            return Err(Error::Other("this encoder has no joint projection".into()));
+        }
         let staging = self.take_staging()?;
-        let r = self.record(mels, None, Timing::None, output, &staging);
-        self.pending(staging, r, output)
+        let r = self.record(Input::Mels(mels), None, Timing::None, output, &staging);
+        self.pending(staging, r)
+    }
+
+    /// Each window's subsampled features (⌈frames / 8⌉ × d_model, NeMo's `pre_encode` before
+    /// the x-scaling), [`max_batch`](Self::max_batch) windows per GPU batch; no block runs.
+    pub fn subsample(&self, mels: &[Mat]) -> Result<Vec<Mat>> {
+        let mut out = Vec::with_capacity(mels.len());
+        for batch in mels.chunks(self.dims.max_batch) {
+            out.extend(self.finish(self.submit_as(batch, Output::PreEncoded)?)?);
+        }
+        Ok(out)
+    }
+
+    /// The blocks on one window of subsampled, x-scaled features (frames × d_model), then
+    /// `tail`'s layers on their output, all in one submission; `tail`'s result comes back.
+    pub(crate) fn encode_rows(&self, x: &Mat, tail: &dyn Tail) -> Result<Mat> {
+        if x.cols != self.dims.d_model || x.rows == 0 || x.rows > self.dims.max_frames {
+            return Err(Error::Other(format!(
+                "{}×{} features for an encoder of {} and at most {} frames",
+                x.rows, x.cols, self.dims.d_model, self.dims.max_frames
+            )));
+        }
+        let staging = self.take_staging()?;
+        let r = self.record(
+            Input::Rows(x),
+            None,
+            Timing::None,
+            Output::Tail(tail),
+            &staging,
+        );
+        let mut out = self.finish(self.pending(staging, r)?)?;
+        Ok(out.remove(0))
     }
 
     fn pending(
         &self,
         staging: wgpu::Buffer,
-        recorded: Result<(Vec<Window>, wgpu::SubmissionIndex)>,
-        output: Output,
+        recorded: Result<(Vec<Window>, wgpu::SubmissionIndex, usize)>,
     ) -> Result<Pending> {
         match recorded {
-            Ok((windows, submission)) => Ok(Pending {
+            Ok((windows, submission, width)) => Ok(Pending {
                 staging,
                 windows,
                 submission,
-                width: match output {
-                    Output::Encoded => self.dims.d_model,
-                    Output::Projected => self.joint.n,
-                },
+                width,
             }),
             Err(e) => {
                 self.staging.lock().unwrap().push(staging);
@@ -546,8 +610,14 @@ impl GpuEncoder {
     pub fn encode_traced(&self, mels: &[Mat], trace: &mut dyn Trace) -> Result<Vec<Mat>> {
         self.check_batch(mels)?;
         let staging = self.take_staging()?;
-        let recorded = self.record(mels, Some(trace), Timing::None, Output::Encoded, &staging);
-        self.finish(self.pending(staging, recorded, Output::Encoded)?)
+        let recorded = self.record(
+            Input::Mels(mels),
+            Some(trace),
+            Timing::None,
+            Output::Encoded,
+            &staging,
+        );
+        self.finish(self.pending(staging, recorded)?)
     }
 
     /// [`encode`](Self::encode) of one batch with GPU timestamps: per submit (`per_dispatch`
@@ -567,8 +637,8 @@ impl GpuEncoder {
             Timing::Passes(&mut profiler)
         };
         let staging = self.take_staging()?;
-        let recorded = self.record(mels, None, timing, Output::Encoded, &staging);
-        let out = self.finish(self.pending(staging, recorded, Output::Encoded)?)?;
+        let recorded = self.record(Input::Mels(mels), None, timing, Output::Encoded, &staging);
+        let out = self.finish(self.pending(staging, recorded)?)?;
         let times = profiler.read(&self.gpu)?;
         Ok((out, times))
     }
@@ -584,20 +654,33 @@ impl GpuEncoder {
         Ok(())
     }
 
-    /// Records and submits one batch, its `output` copied into `staging`; returns the windows
-    /// and the last submission.
+    /// Records and submits one batch, its `output` copied into `staging`; returns the windows,
+    /// the last submission and the output's width per row.
     fn record(
         &self,
-        mels: &[Mat],
+        input: Input,
         mut trace: Option<&mut dyn Trace>,
         timing: Timing,
         output: Output,
         staging: &wgpu::Buffer,
-    ) -> Result<(Vec<Window>, wgpu::SubmissionIndex)> {
+    ) -> Result<(Vec<Window>, wgpu::SubmissionIndex, usize)> {
         let d = self.dims;
         let gpu = &*self.gpu;
-        let mut windows = Vec::with_capacity(mels.len());
+        let mels = match input {
+            Input::Mels(mels) => mels,
+            Input::Rows(_) => &[],
+        };
+        let mut windows = Vec::with_capacity(mels.len().max(1));
         let (mut start, mut mel_offset) = (0, 0);
+        if let Input::Rows(x) = input {
+            windows.push(Window {
+                mel_frames: 0,
+                mel_offset: 0,
+                start: 0,
+                frames: x.rows,
+            });
+            start = x.rows;
+        }
         for mel in mels {
             if mel.rows != d.mels || mel.cols == 0 || mel.cols > d.max_mel_frames {
                 return Err(Error::Other(format!(
@@ -641,31 +724,49 @@ impl GpuEncoder {
         };
 
         // Subsampling, window by window, each window's flattened frames copied into its rows
-        // of `hidden`; then the projection to d_model over the whole batch, with ×√d_model.
+        // of `hidden`; then the projection to d_model over the whole batch, with ×√d_model
+        // (unless it's the output). Rows given as input go straight to the residual stream.
         let flat = d.channels * d.freq;
-        for w in &windows {
-            self.pre_encode(&mut rec, b, w);
-            let bytes = (w.frames * flat * 4) as u64;
-            rec.copy(
-                &b.pre[1],
-                0,
-                &b.hidden.buffer,
-                (w.start * flat * 4) as u64,
-                bytes,
+        if let Input::Rows(x) = input {
+            gpu.queue
+                .write_buffer(&b.residual[0].buffer, 0, f32_bytes(&x.data));
+        }
+        if !mels.is_empty() {
+            for w in &windows {
+                self.pre_encode(&mut rec, b, w);
+                let bytes = (w.frames * flat * 4) as u64;
+                rec.copy(
+                    &b.pre[1],
+                    0,
+                    &b.hidden.buffer,
+                    (w.start * flat * 4) as u64,
+                    bytes,
+                );
+            }
+            let scale = match output {
+                Output::PreEncoded => 1.,
+                _ => self.xscale,
+            };
+            self.gemm(
+                &mut rec,
+                "gemm/pre_encode.out",
+                &b.hidden,
+                &self.pre.out,
+                &b.residual[0],
+                rows,
+                Epilogue {
+                    scale,
+                    ..Epilogue::default()
+                },
             );
         }
-        self.gemm(
-            &mut rec,
-            "gemm/pre_encode.out",
-            &b.hidden,
-            &self.pre.out,
-            &b.residual[0],
-            rows,
-            Epilogue {
-                scale: self.xscale,
-                ..Epilogue::default()
-            },
-        );
+        if let Output::PreEncoded = output {
+            rec.copy(&b.residual[0], 0, staging, 0, (rows * d.d_model * 4) as u64);
+            let submission = rec
+                .submit()
+                .ok_or_else(|| Error::Other("nothing recorded".into()))?;
+            return Ok((windows, submission, d.d_model));
+        }
         if let Some(trace) = trace.as_deref_mut()
             && trace.wants("enc.pre_encode.out")
         {
@@ -817,26 +918,32 @@ impl GpuEncoder {
         }
 
         let out = &b.residual[self.blocks.len() % 2];
-        match output {
-            Output::Encoded => rec.copy(out, 0, staging, 0, (rows * d.d_model * 4) as u64),
+        let width = match output {
+            Output::Encoded | Output::PreEncoded => {
+                rec.copy(out, 0, staging, 0, (rows * d.d_model * 4) as u64);
+                d.d_model
+            }
             Output::Projected => {
+                let joint = self.joint.as_ref().expect("checked when submitted");
                 // Into `normed`, free once the last block's layer norm has run.
                 self.gemm(
                     &mut rec,
                     "gemm/joint.enc",
                     out,
-                    &self.joint,
+                    joint,
                     &b.normed,
                     rows,
                     Epilogue::default(),
                 );
-                rec.copy(&b.normed, 0, staging, 0, (rows * self.joint.n * 4) as u64);
+                rec.copy(&b.normed, 0, staging, 0, (rows * joint.n * 4) as u64);
+                joint.n
             }
-        }
+            Output::Tail(tail) => tail.record(&mut rec, out, rows, staging),
+        };
         let submission = rec
             .submit()
             .ok_or_else(|| Error::Other("nothing recorded".into()))?;
-        Ok((windows, submission))
+        Ok((windows, submission, width))
     }
 
     /// One window's subsampling up to its flattened frames, in `pre[1]` (frames × freq ×
@@ -935,7 +1042,8 @@ impl GpuEncoder {
             &self.kernels.attend,
             &[&b.qkv, &b.scores, &b.windows, &b.context],
             &[tm as u32],
-            [(d_head / 128) as u32, tiles, z],
+            // Tiles of 128 of a head's features, or one of 64.
+            [(d_head / 4 / (d_head / 4).min(32)) as u32, tiles, z],
         );
     }
 
@@ -1132,7 +1240,7 @@ fn load_block(gpu: &Gpu, file: &Gguf, name: &str, d: &Dims) -> Result<Block> {
 }
 
 /// Layers with the same inputs as one: their output rows (and biases) one after another.
-fn stacked(gpu: &Gpu, file: &Gguf, label: &str, names: &[String]) -> Result<Weights> {
+pub(crate) fn stacked(gpu: &Gpu, file: &Gguf, label: &str, names: &[String]) -> Result<Weights> {
     let mut weight = Vec::new();
     let mut bias = Vec::new();
     let (mut k, mut inexact) = (None, 0);
@@ -1158,7 +1266,7 @@ fn stacked(gpu: &Gpu, file: &Gguf, label: &str, names: &[String]) -> Result<Weig
 }
 
 /// A linear layer `name` (its `.weight` and any `.bias`) uploaded for [`Gemm`].
-fn upload_linear(gpu: &Gpu, file: &Gguf, name: &str, label: &str) -> Result<Weights> {
+pub(crate) fn upload_linear(gpu: &Gpu, file: &Gguf, name: &str, label: &str) -> Result<Weights> {
     let layer = F16Linear::load(file, name)?;
     Ok(Weights {
         n: layer.rows,

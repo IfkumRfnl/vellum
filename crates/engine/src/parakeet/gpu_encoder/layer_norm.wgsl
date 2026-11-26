@@ -3,9 +3,10 @@
 // deviation from it), so nothing overflows or cancels at the residual stream's magnitudes
 // (up to ~1,400).
 //
-// One workgroup of 256 threads per row; each thread holds D4 / 256 vec4s.
+// One workgroup of 256 threads per row; each thread holds up to ⌈D4 / 256⌉ vec4s (thread t
+// the ones at t, t + 256, …).
 //
-// Prepended by the host: const D4 (d_model / 4, a multiple of 256).
+// Prepended by the host: const D4 (the width / 4).
 
 struct Params {
     rows: u32,
@@ -19,7 +20,7 @@ var<immediate> p: Params;
 @group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> out: array<vec4<f32>>;
 
-const PER: u32 = D4 / 256u;
+const PER: u32 = (D4 + 255u) / 256u;
 
 var<workgroup> partial: array<f32, 256>;
 
@@ -47,19 +48,26 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     var v: array<vec4<f32>, PER>;
     var sum = 0.0;
     for (var i = 0u; i < PER; i++) {
-        v[i] = x[base + tid + i * 256u];
-        sum += (v[i].x + v[i].y) + (v[i].z + v[i].w);
+        v[i] = vec4<f32>(0.0);
+        if tid + i * 256u < D4 {
+            v[i] = x[base + tid + i * 256u];
+            sum += (v[i].x + v[i].y) + (v[i].z + v[i].w);
+        }
     }
     let n = f32(D4 * 4u);
     let mean = total(tid, sum) / n;
     var sq = 0.0;
     for (var i = 0u; i < PER; i++) {
-        let d = v[i] - mean;
-        sq += dot(d, d);
+        if tid + i * 256u < D4 {
+            let d = v[i] - mean;
+            sq += dot(d, d);
+        }
     }
     let inv = 1.0 / sqrt(total(tid, sq) / n + p.eps);
     for (var i = 0u; i < PER; i++) {
         let at = tid + i * 256u;
-        out[base + at] = (v[i] - mean) * inv * weight[at] + bias[at];
+        if at < D4 {
+            out[base + at] = (v[i] - mean) * inv * weight[at] + bias[at];
+        }
     }
 }

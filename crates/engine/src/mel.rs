@@ -67,11 +67,15 @@ impl Mel {
                 .map(|v| v as f32 as f64)
                 .ok_or_else(|| missing(name))
         };
+        // Where a file leaves a field out (Sortformer's has no type or band edges), the
+        // reference's own defaults (`MelConfig`): a mel frontend over 0–8000 Hz.
+        let real_or = |name: &str, default: f64| real(name).or(Ok::<f64, Error>(default));
         let text = |name: &str| file.metadata_str(&key(name)).ok_or_else(|| missing(name));
 
         let unsupported = |what: String| Err(Error::Unsupported(format!("{what} frontends")));
-        if text("type")? != "mel" {
-            return unsupported(format!("\"{}\"", text("type")?));
+        let kind = file.metadata_str(&key("type")).unwrap_or("mel");
+        if kind != "mel" {
+            return unsupported(format!("\"{kind}\""));
         }
         if text("window")? != "hann" {
             return unsupported(format!("\"{}\"-window", text("window")?));
@@ -92,8 +96,13 @@ impl Mel {
             )));
         }
 
-        let filterbank =
-            slaney_filterbank(sample_rate, n_fft, num_mels, real("f_min")?, real("f_max")?);
+        let filterbank = slaney_filterbank(
+            sample_rate,
+            n_fft,
+            num_mels,
+            real_or("f_min", 0.)?,
+            real_or("f_max", 8000.)?,
+        );
         let n_freq = n_fft / 2 + 1;
         let bands = filterbank
             .chunks(n_freq)
@@ -136,11 +145,45 @@ impl Mel {
     /// them (the layout of the reference's `enc.mel.in` dump, padding frame included).
     pub fn compute(&self, pcm: &[f32]) -> Mat {
         let frames = self.frames(pcm.len());
-        let power = self.power_spectrum(pcm, frames);
-        let n_freq = self.n_fft / 2 + 1;
+        let mut out = self.log_mel(pcm, 0..frames);
         let valid = self.valid_frames(pcm.len());
+        out.data
+            .par_chunks_mut(frames)
+            .for_each(|row| match self.normalize {
+                Normalize::PerFeature => normalize_feature(row, valid),
+                Normalize::None => row[valid.min(frames)..].fill(0.),
+            });
+        out
+    }
 
+    /// Frames `range` of the features, computed alone (exactly those columns of what
+    /// [`compute`](Self::compute) gives): a long recording's features a window at a time,
+    /// without holding all of them. Only for features normalized frame by frame, not over the
+    /// whole recording (`normalize = "none"`); frames from the `n / hop`-th on are zero.
+    pub fn compute_frames(&self, pcm: &[f32], range: std::ops::Range<usize>) -> Result<Mat> {
+        if self.normalize != Normalize::None {
+            return Err(Error::Unsupported(
+                "windowed features normalized over the recording".into(),
+            ));
+        }
+        let mut out = self.log_mel(pcm, range.clone());
+        let valid = self.valid_frames(pcm.len());
+        let first_zero = valid.clamp(range.start, range.end) - range.start;
+        out.data
+            .par_chunks_mut(range.len().max(1))
+            .for_each(|row| row[first_zero..].fill(0.));
+        Ok(out)
+    }
+
+    /// The unnormalized log-mel of frames `range`: `num_mels` rows of `range.len()` values.
+    fn log_mel(&self, pcm: &[f32], range: std::ops::Range<usize>) -> Mat {
+        let frames = range.len();
+        let power = self.power_spectrum(pcm, range);
+        let n_freq = self.n_fft / 2 + 1;
         let mut out = Mat::zeros(self.num_mels, frames);
+        if frames == 0 {
+            return out;
+        }
         out.data
             .par_chunks_mut(frames)
             .zip(self.filterbank.par_chunks(n_freq))
@@ -150,25 +193,25 @@ impl Mel {
                     let spectrum = &power[t * n_freq..(t + 1) * n_freq];
                     *value = (mel_energy(weights, spectrum, lo, hi) + LOG_GUARD).ln() as f32;
                 }
-                match self.normalize {
-                    Normalize::PerFeature => normalize_feature(row, valid),
-                    Normalize::None => row[valid..].fill(0.),
-                }
             });
         out
     }
 
-    /// Pre-emphasis, centering, window and FFT: `frames` rows of `n_fft / 2 + 1` powers.
-    fn power_spectrum(&self, pcm: &[f32], frames: usize) -> Vec<f32> {
+    /// Pre-emphasis, centering, window and FFT: a row of `n_fft / 2 + 1` powers for each frame
+    /// in `range`. The centered, pre-emphasized signal is read sample by sample (in f64), so
+    /// no copy of the recording is made.
+    fn power_spectrum(&self, pcm: &[f32], range: std::ops::Range<usize>) -> Vec<f32> {
         let pad = self.n_fft / 2;
-        let mut padded = vec![0f64; pcm.len() + 2 * pad];
-        for (i, &x) in pcm.iter().enumerate() {
-            let previous = if i == 0 { 0. } else { pcm[i - 1] as f64 };
-            padded[pad + i] = x as f64 - self.pre_emphasis * previous;
-        }
-
+        // Sample `j` of the zero-padded, pre-emphasized signal.
+        let padded = |j: usize| -> f64 {
+            match j.checked_sub(pad).filter(|&i| i < pcm.len()) {
+                Some(0) => pcm[0] as f64,
+                Some(i) => pcm[i] as f64 - self.pre_emphasis * pcm[i - 1] as f64,
+                None => 0.,
+            }
+        };
         let n_freq = self.n_fft / 2 + 1;
-        let mut power = vec![0f32; frames * n_freq];
+        let mut power = vec![0f32; range.len() * n_freq];
         let scratch_len = self.fft.get_inplace_scratch_len();
         power.par_chunks_mut(n_freq).enumerate().for_each_init(
             || {
@@ -176,9 +219,9 @@ impl Mel {
                 (vec![zero; self.n_fft], vec![zero; scratch_len])
             },
             |(buffer, scratch), (t, out)| {
-                let frame = &padded[t * self.hop..t * self.hop + self.n_fft];
-                for ((b, &x), &w) in buffer.iter_mut().zip(frame).zip(&self.window) {
-                    *b = Complex64::new(x * w, 0.);
+                let start = (range.start + t) * self.hop;
+                for (k, (b, &w)) in buffer.iter_mut().zip(&self.window).enumerate() {
+                    *b = Complex64::new(padded(start + k) * w, 0.);
                 }
                 self.fft.process_with_scratch(buffer, scratch);
                 for (p, c) in out.iter_mut().zip(buffer.iter()) {

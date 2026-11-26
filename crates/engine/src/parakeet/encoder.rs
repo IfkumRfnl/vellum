@@ -9,7 +9,7 @@
 
 mod attention;
 mod block;
-mod rounding;
+pub(crate) mod rounding;
 mod subsampling;
 
 use super::HParams;
@@ -65,8 +65,22 @@ impl Encoder {
     /// frames are the ones the encoder sees: the reference drops the mel's trailing
     /// centering-pad frame (keeping `Mel::valid_frames`) after its `enc.mel.in` dump.
     pub fn forward(&self, mel: &Mat, trace: &mut dyn Trace) -> Mat {
-        let mut x = self.subsampling.forward(mel);
+        let mut x = self.subsample(mel);
         checkpoint(trace, "enc.pre_encode.out", &mut x);
+        self.conformer(x, trace)
+    }
+
+    /// The 8× subsampling alone: mel features (`num_mels` × frames) to ⌈frames / 8⌉ ×
+    /// `d_model` (NeMo's `pre_encode`, before the x-scaling).
+    pub fn subsample(&self, mel: &Mat) -> Mat {
+        self.subsampling.forward(mel)
+    }
+
+    /// The conformer on subsampled features (frames × `d_model`): the x-scaling, the
+    /// positional encodings of the frames given, every block. Streaming Sortformer runs it on
+    /// its speaker cache and newest chunk joined, which [`subsample`](Self::subsample) made
+    /// apart.
+    pub fn conformer(&self, mut x: Mat, trace: &mut dyn Trace) -> Mat {
         if self.xscale != 1. {
             let s = self.xscale;
             x.map(|v| v * s);

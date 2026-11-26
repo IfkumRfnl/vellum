@@ -11,6 +11,9 @@
 //! global rayon pool. When there are fewer windows than decoder threads, each window gets a
 //! [`Team`] that shares its decoding.
 //!
+//! Results go to the caller in window order as they're done, on the calling thread (which runs
+//! the encoder stage), between batches. A stop check is polled by every stage between windows.
+//!
 //! A window's result is exactly what [`Parakeet::run`] gives for it alone: every stage works
 //! on one window at a time (or, for an encoder that batches, computes each window as if alone),
 //! and nothing a stage computes depends on the threads it ran on.
@@ -152,15 +155,19 @@ struct InFlight {
 const MEL_THREADS: usize = 4;
 
 impl Parakeet {
-    /// Every window through the three stages, with `stage` as the encoder; results in window
-    /// order.
+    /// Every window through the three stages, with `stage` as the encoder; each result to
+    /// `each` in window order, as soon as it and those before it are decoded. When `stop`
+    /// says so, every stage gives up after the window (or batch) it's on and the run returns
+    /// [`Error::Cancelled`].
     pub fn pipeline(
         &self,
         windows: &[&[f32]],
         stage: &mut dyn EncoderStage,
-    ) -> Result<Vec<Transcript>> {
+        stop: &(dyn Fn() -> bool + Sync),
+        each: &mut dyn FnMut(usize, Transcript) -> Result<()>,
+    ) -> Result<()> {
         if windows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let budget = threads
@@ -179,7 +186,9 @@ impl Parakeet {
         let short = windows.len() <= budget;
         let batch = stage.batch().max(1);
         let mel_pool = self.mel_pool()?;
+        // Decoded windows that came out of order, until those before them are done.
         let mut results: Vec<Option<Transcript>> = vec![None; windows.len()];
+        let mut next = 0;
         // Encoded windows, for whichever decoder is free.
         let (encoded_tx, encoded) = mpsc::sync_channel::<InFlight>(2 * decoders);
         let encoded = Mutex::new(encoded);
@@ -189,6 +198,9 @@ impl Parakeet {
             s.spawn(move || {
                 mel_pool.install(|| {
                     for (index, pcm) in windows.iter().enumerate() {
+                        if stop() {
+                            break; // the encoder stage stops too
+                        }
                         let start = Instant::now();
                         let data = self.features(pcm, &mut NoTrace);
                         let timings = crate::Timings {
@@ -220,6 +232,11 @@ impl Parakeet {
                         .map_err(drop)
                         .and_then(|queue| queue.recv().map_err(drop))
                     {
+                        // Stopped: drain the queue without decoding, so the encoder stage
+                        // never waits on a full one.
+                        if stop() {
+                            continue;
+                        }
                         let start = Instant::now();
                         free.fetch_sub(1, SeqCst);
                         let after = unstarted.fetch_sub(1, SeqCst) - 1;
@@ -283,8 +300,33 @@ impl Parakeet {
                 }
                 Ok(())
             };
+            // Hands the caller every decoded window it can have yet: `wait` blocks for the
+            // rest, until the decoders are done.
+            let mut deliver = |wait: bool| -> Result<()> {
+                loop {
+                    let got = if wait {
+                        done.recv().ok()
+                    } else {
+                        done.try_recv().ok()
+                    };
+                    let Some((index, transcript)) = got else {
+                        return Ok(());
+                    };
+                    results[index] = Some(transcript);
+                    while let Some(transcript) = results.get_mut(next).and_then(Option::take) {
+                        if stop() {
+                            return Err(Error::Cancelled);
+                        }
+                        each(next, transcript)?;
+                        next += 1;
+                    }
+                }
+            };
             let mut count = 0;
             loop {
+                if stop() {
+                    return Err(Error::Cancelled);
+                }
                 // Toward the end the batches halve, so the last windows come out of the
                 // encoder a few at a time and decode on big teams as they come, instead of
                 // all at once after the GPU is done.
@@ -318,6 +360,10 @@ impl Parakeet {
                     hand_on(projected, &mut submitted, started, count == windows.len())?;
                     started = Instant::now();
                 }
+                deliver(false)?;
+            }
+            if stop() {
+                return Err(Error::Cancelled);
             }
             let projected = stage.flush()?;
             hand_on(projected, &mut submitted, started, true)?;
@@ -328,17 +374,16 @@ impl Parakeet {
                 )));
             }
             drop(encoded_tx);
-            for (index, transcript) in done {
-                results[index] = Some(transcript);
-            }
-            Ok(())
+            deliver(true)
         });
         outcome?;
-        results
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| r.ok_or_else(|| Error::Other(format!("window {i} wasn't decoded"))))
-            .collect()
+        if stop() {
+            return Err(Error::Cancelled);
+        }
+        match next {
+            n if n == windows.len() => Ok(()),
+            n => Err(Error::Other(format!("window {n} wasn't decoded"))),
+        }
     }
 
     /// The pool mel features are made on during a pipeline: made at first use, kept.

@@ -51,12 +51,7 @@ fn calibrate(
     report: &mut Report,
     work: &std::path::Path,
 ) -> Result<bool> {
-    let runs_on = check::clips(corpus, model, Tier::Long);
-    let clips: Vec<&Clip> = corpus
-        .select(Tier::Quick, Purpose::Probe)
-        .into_iter()
-        .filter(|c| runs_on.iter().any(|r| r.id == c.id) && c.seconds <= 28.)
-        .collect();
+    let clips = probe_clips(corpus, model, Tier::Quick);
     anyhow::ensure!(!clips.is_empty(), "no probe clips for {}", model.id);
     let cpu: Candidate = "ref-cpu".parse()?;
     let gpu: Candidate = "ref-gpu".parse()?;
@@ -94,19 +89,38 @@ fn calibrate(
     Ok(true)
 }
 
+/// The clips a model is probed and calibrated on, up to `tier`: a speech model's one-window
+/// Probe clips; for a speaker model, which takes a whole recording in one call and has no Probe
+/// clips, the diarization recordings of at most 200 s (the 3-minute AMI crop, the shortest
+/// VoxConverse ones), long enough for its speaker cache to be compressed several times.
+fn probe_clips<'a>(corpus: &'a Corpus, model: &models::Model, tier: Tier) -> Vec<&'a Clip> {
+    if model.kind == models::Kind::Speakers {
+        return check::clips(corpus, model, tier)
+            .into_iter()
+            .filter(|c| c.seconds <= 200.)
+            .collect();
+    }
+    let runs_on = check::clips(corpus, model, Tier::Long);
+    corpus
+        .select(tier, Purpose::Probe)
+        .into_iter()
+        .filter(|c| runs_on.iter().any(|r| r.id == c.id) && c.seconds <= 28.)
+        .collect()
+}
+
 fn probe_clip<'a>(corpus: &'a Corpus, model: &models::Model, id: Option<&str>) -> Result<&'a Clip> {
     if let Some(id) = id {
         return corpus
             .get(id)
             .with_context(|| format!("no clip {id} in the corpus"));
     }
-    let runs_on = check::clips(corpus, model, Tier::Long);
-    let mut probes: Vec<&Clip> = corpus
-        .select(Tier::Long, Purpose::Probe)
-        .into_iter()
-        .filter(|c| runs_on.iter().any(|r| r.id == c.id))
-        .collect();
-    probes.sort_by(|a, b| a.tier.cmp(&b.tier).then(a.id.cmp(&b.id)));
+    let mut probes = probe_clips(corpus, model, Tier::Long);
+    probes.sort_by(|a, b| {
+        a.tier
+            .cmp(&b.tier)
+            .then(a.seconds.total_cmp(&b.seconds))
+            .then(a.id.cmp(&b.id))
+    });
     probes.first().copied().with_context(|| {
         format!(
             "no probe clip for {}; run `cargo lab fetch --tier smoke`",
@@ -119,7 +133,7 @@ pub fn probe(args: &Args) -> Result<bool> {
     let corpus = Corpus::load(&paths::corpus()?)?;
     let model = models::get(&args.model)?;
     let clip = probe_clip(&corpus, model, args.clip.as_deref())?;
-    if clip.seconds > 28. {
+    if clip.seconds > 28. && model.kind == models::Kind::Speech {
         eprintln!(
             "! {} is {:.0} s, more than one window: the dumps show its last window",
             clip.id, clip.seconds

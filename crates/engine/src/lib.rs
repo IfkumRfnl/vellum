@@ -11,8 +11,10 @@ pub mod gguf;
 pub mod gpu;
 pub mod mel;
 pub mod parakeet;
+pub mod sortformer;
 pub mod tokenizer;
 pub mod trace;
+pub mod whisper;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -29,6 +31,9 @@ pub enum Error {
     Gguf(String),
     #[error("{0} models aren't supported yet")]
     Unsupported(String),
+    /// The caller's stop check asked a run to stop.
+    #[error("cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
@@ -194,8 +199,12 @@ pub struct Transcriber {
     model: SpeechModel,
 }
 
+// One per transcriber: its size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 enum SpeechModel {
     Parakeet(parakeet::Parakeet),
+    /// On the CPU, whatever the device asked for (it has no GPU path yet).
+    Whisper(whisper::Whisper),
 }
 
 impl Transcriber {
@@ -206,6 +215,7 @@ impl Transcriber {
             "parakeet" => {
                 SpeechModel::Parakeet(parakeet::Parakeet::load(&file, gpu(options.device)?)?)
             }
+            "whisper" => SpeechModel::Whisper(whisper::Whisper::load(&file)?),
             _ => return Err(Error::Unsupported(arch)),
         };
         Ok(Transcriber { model })
@@ -214,12 +224,16 @@ impl Transcriber {
     pub fn info(&self) -> &ModelInfo {
         match &self.model {
             SpeechModel::Parakeet(m) => &m.info,
+            SpeechModel::Whisper(m) => &m.info,
         }
     }
 
     /// The longest window of audio [`run`](Self::run) takes, in milliseconds.
     pub fn max_audio_ms(&self) -> u32 {
-        30_000
+        match &self.model {
+            SpeechModel::Parakeet(_) => 30_000,
+            SpeechModel::Whisper(m) => m.max_audio_ms(),
+        }
     }
 
     pub fn run(
@@ -230,6 +244,7 @@ impl Transcriber {
     ) -> Result<Transcript> {
         match &self.model {
             SpeechModel::Parakeet(m) => m.run(pcm, options, trace),
+            SpeechModel::Whisper(m) => m.run(pcm, options, trace),
         }
     }
 
@@ -244,28 +259,74 @@ impl Transcriber {
         options: &RunOptions,
         trace: &mut dyn Trace,
     ) -> Result<Vec<Transcript>> {
+        let mut out = Vec::with_capacity(windows.len());
+        self.run_each(windows, options, trace, &|| false, &mut |_, t| {
+            out.push(t);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// [`run_all`](Self::run_all) for an app: each window's transcript goes to `each` (with
+    /// its index) as soon as it and every window before it are done, on the calling thread,
+    /// so a long recording shows progress as it goes. `stop` is polled between windows and
+    /// batches; once it says so, the run gives up within about a window's work and returns
+    /// [`Error::Cancelled`]. An error from `each` stops the run the same way and is returned.
+    pub fn run_each(
+        &mut self,
+        windows: &[&[f32]],
+        options: &RunOptions,
+        trace: &mut dyn Trace,
+        stop: &(dyn Fn() -> bool + Sync),
+        each: &mut dyn FnMut(usize, Transcript) -> Result<()>,
+    ) -> Result<()> {
         match &self.model {
-            SpeechModel::Parakeet(m) => m.run_all(windows, options, trace),
+            SpeechModel::Parakeet(m) => m.run_each(windows, options, trace, stop, each),
+            SpeechModel::Whisper(m) => m.run_each(windows, options, trace, stop, each),
+        }
+    }
+
+    /// The GPU the model runs on, if it runs on one.
+    pub fn gpu(&self) -> Option<&gpu::Gpu> {
+        match &self.model {
+            SpeechModel::Parakeet(m) => m.gpu(),
+            SpeechModel::Whisper(_) => None,
         }
     }
 }
 
 /// A speaker model, loaded.
 pub struct Diarizer {
-    info: ModelInfo,
+    model: SpeakerModel,
+}
+
+enum SpeakerModel {
+    Sortformer(sortformer::Sortformer),
 }
 
 impl Diarizer {
-    pub fn load(path: &Path, _options: &Options) -> Result<Self> {
-        let (_file, arch) = architecture(path)?;
-        Err(Error::Unsupported(arch))
+    pub fn load(path: &Path, options: &Options) -> Result<Self> {
+        keep_full_speed();
+        let (file, arch) = architecture(path)?;
+        let model = match arch.as_str() {
+            "sortformer" => {
+                SpeakerModel::Sortformer(sortformer::Sortformer::load(&file, gpu(options.device)?)?)
+            }
+            _ => return Err(Error::Unsupported(arch)),
+        };
+        Ok(Diarizer { model })
     }
 
     pub fn info(&self) -> &ModelInfo {
-        &self.info
+        match &self.model {
+            SpeakerModel::Sortformer(m) => &m.info,
+        }
     }
 
-    pub fn run(&mut self, _pcm: &[f32], _trace: &mut dyn Trace) -> Result<Vec<SpeakerTurn>> {
-        Err(Error::Unsupported(self.info.architecture.clone()))
+    /// A whole recording of 16 kHz mono audio to speaker turns.
+    pub fn run(&mut self, pcm: &[f32], trace: &mut dyn Trace) -> Result<Vec<SpeakerTurn>> {
+        match &self.model {
+            SpeakerModel::Sortformer(m) => m.run(pcm, trace),
+        }
     }
 }

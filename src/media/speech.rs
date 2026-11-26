@@ -4,10 +4,14 @@ use crate::{
     pipeline::{Stage, Update},
 };
 use anyhow::{Context, Result, ensure};
-use std::{collections::HashMap, path::Path, sync::OnceLock};
+use std::{collections::HashMap, ops::Range, path::Path, sync::OnceLock};
 use transcribe_cpp::{
     Backend, DiarizeExtension, DiarizeOptions, Error, Model, ModelOptions, RunOptions, Session,
     SortformerDiarizeOptions, SortformerPreset, SpeakerSegment, TimestampKind,
+};
+use vellum_engine::{
+    Device, Error as EngineError, NoTrace, Options as EngineOptions,
+    RunOptions as EngineRunOptions, Transcriber,
 };
 
 const RATE: usize = 16000;
@@ -45,6 +49,15 @@ fn speech_devices() -> Result<()> {
     Ok(())
 }
 
+/// Whether Parakeet runs on Vellum's own engine (`crates/engine`), which gives transcribe.cpp's
+/// transcripts about three times as fast. `VELLUM_ENGINE=cpp` switches it back to
+/// transcribe.cpp, to compare the two. The Whisper models stay on transcribe.cpp until their
+/// port lands.
+fn own_engine(model: &models::SpeechModel) -> bool {
+    model.id == "parakeet_unified_en"
+        && !std::env::var("VELLUM_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("cpp"))
+}
+
 // Look for the quietest 40 ms near the end of a full window.
 fn boundary(pcm: &[f32]) -> usize {
     let frame = RATE / 25;
@@ -61,6 +74,70 @@ fn boundary(pcm: &[f32]) -> usize {
     start + quietest * frame + frame / 2
 }
 
+/// The windows a recording is read in, in order, covering it exactly: `window` samples at
+/// most, each but the last ending at a [`boundary`].
+fn windows(pcm: &[f32], window: usize) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < pcm.len() {
+        let end = (offset + window).min(pcm.len());
+        let count = if end < pcm.len() {
+            boundary(&pcm[offset..end])
+        } else {
+            end - offset
+        };
+        out.push(offset..offset + count);
+        offset += count;
+    }
+    out
+}
+
+/// The window length in samples: 28 s, or the model's limit when that's shorter (0: none).
+fn window_samples(max_ms: i64) -> usize {
+    let ms = if max_ms > 0 {
+        max_ms.min(28_000)
+    } else {
+        28_000
+    };
+    ms as usize * RATE / 1000
+}
+
+/// One window's recognized pieces (`(t0_ms, t1_ms, text)` from the window's start) as cues, or
+/// its whole text as one cue when it has no timed pieces, and what was heard to the progress
+/// screen. The window is `count` samples from `offset` into the recording.
+fn add_window(
+    cues: &mut Vec<Cue>,
+    offset: usize,
+    count: usize,
+    pieces: impl IntoIterator<Item = (i64, i64, String)>,
+    text: String,
+    progress: &Progress,
+) -> Result<()> {
+    let start = offset as f64 / RATE as f64;
+    let prior = cues.len();
+    for (from, to, piece) in pieces {
+        if !piece.trim().is_empty() {
+            cues.push(Cue::new(
+                start + from as f64 / 1000.,
+                start + to as f64 / 1000.,
+                piece,
+            ));
+        }
+    }
+    if cues.len() == prior && !text.trim().is_empty() {
+        cues.push(Cue::new(start, start + count as f64 / RATE as f64, text));
+    }
+    let heard = super::join_words(cues[prior..].iter().map(|c| c.text.as_str()));
+    if !heard.is_empty() {
+        progress.update(Update::Heard {
+            words: crate::document::word_count(&heard),
+            text: heard,
+            until: (offset + count) as f64 / RATE as f64,
+        })?;
+    }
+    Ok(())
+}
+
 pub fn transcribe(
     wav: &Path,
     cache: &Path,
@@ -70,6 +147,9 @@ pub fn transcribe(
     progress.stage(Stage::Model)?;
     let path = model.artifact.get(cache, progress)?;
     progress.update(Update::Estimated)?;
+    if own_engine(model) {
+        return transcribe_with_engine(wav, &path, model, progress);
+    }
     speech_devices()?;
     let mut session = match open_session(&path, Backend::Auto) {
         Err(error) if device_error(&error) => cpu_session(&path, error, progress)?,
@@ -87,14 +167,7 @@ pub fn transcribe(
         format!("{kind} · {}", device.description)
     }))?;
     session.set_cancel_token(progress.token());
-    let max_ms = session.limits()?.effective_max_audio_ms;
-    let window = if max_ms > 0 {
-        max_ms.min(28_000)
-    } else {
-        28_000
-    } as usize
-        * RATE
-        / 1000;
+    let window = window_samples(session.limits()?.effective_max_audio_ms);
     let mut options = RunOptions {
         language: (model.id == "parakeet_unified_en").then(|| "en".into()),
         ..Default::default()
@@ -131,45 +204,18 @@ pub fn transcribe(
             if options.language.is_none() && !result.text.trim().is_empty() {
                 options.language = result.language;
             }
-            let start = offset as f64 / RATE as f64;
-            let prior = cues.len();
-            let mut add = |from: i64, to: i64, text: String| {
-                if !text.trim().is_empty() {
-                    cues.push(Cue::new(
-                        start + from as f64 / 1000.,
-                        start + to as f64 / 1000.,
-                        text,
-                    ));
-                }
-            };
-            if matches!(
+            let pieces: Vec<(i64, i64, String)> = if matches!(
                 result.timestamp_kind,
                 TimestampKind::Word | TimestampKind::Token
             ) && !result.words.is_empty()
             {
-                for w in result.words {
-                    add(w.t0_ms, w.t1_ms, w.text);
-                }
+                let words = result.words.into_iter();
+                words.map(|w| (w.t0_ms, w.t1_ms, w.text)).collect()
             } else {
-                for s in result.segments {
-                    add(s.t0_ms, s.t1_ms, s.text);
-                }
-            }
-            if cues.len() == prior && !result.text.trim().is_empty() {
-                cues.push(Cue::new(
-                    start,
-                    start + count as f64 / RATE as f64,
-                    result.text,
-                ));
-            }
-            let heard = super::join_words(cues[prior..].iter().map(|c| c.text.as_str()));
-            if !heard.is_empty() {
-                progress.update(Update::Heard {
-                    words: crate::document::word_count(&heard),
-                    text: heard,
-                    until: (offset + count) as f64 / RATE as f64,
-                })?;
-            }
+                let segments = result.segments.into_iter();
+                segments.map(|s| (s.t0_ms, s.t1_ms, s.text)).collect()
+            };
+            add_window(&mut cues, offset, count, pieces, result.text, progress)?;
         }
         offset += count;
         progress.fraction(offset as f32 / total as f32)?;
@@ -180,6 +226,127 @@ pub fn transcribe(
         model.name.into(),
         options.language.unwrap_or_default(),
     ))
+}
+
+/// Loads Parakeet on Vellum's engine: on the GPU when there's a good one, else (or when the GPU
+/// can't take the model) on the CPU. Names the device on the progress screen as the
+/// transcribe.cpp path does ("Vulkan · NVIDIA GeForce RTX 4060 Laptop GPU", "CPU").
+fn load_engine(path: &Path, progress: &Progress) -> Result<Transcriber> {
+    let load = |device| Transcriber::load(path, &EngineOptions { device });
+    let transcriber = match load(Device::Auto) {
+        // A file the engine can't read fails the same way on the CPU.
+        Err(error @ (EngineError::Io(_) | EngineError::Gguf(_) | EngineError::Unsupported(_))) => {
+            return Err(error).context("Could not load the speech model");
+        }
+        Err(error) => {
+            progress.note("Switching to the CPU…")?;
+            load(Device::Cpu).with_context(|| format!("CPU fallback failed after {error}"))?
+        }
+        Ok(transcriber) => transcriber,
+    };
+    progress.update(Update::Device(engine_device(&transcriber)))?;
+    Ok(transcriber)
+}
+
+/// The device a model runs on as the progress screen names it: the graphics API and the GPU,
+/// or "CPU".
+fn engine_device(transcriber: &Transcriber) -> String {
+    use vellum_engine::gpu::wgpu::Backend;
+    let Some(gpu) = transcriber.gpu() else {
+        return "CPU".into();
+    };
+    let api = match gpu.info.backend {
+        Backend::Vulkan => "Vulkan".to_owned(),
+        Backend::Metal => "Metal".to_owned(),
+        Backend::Dx12 => "DirectX 12".to_owned(),
+        Backend::Gl => "OpenGL".to_owned(),
+        other => format!("{other:?}"),
+    };
+    format!("{api} · {}", gpu.info.name)
+}
+
+/// Parakeet on Vellum's engine: the whole recording, cut into the same windows as the
+/// transcribe.cpp path (exactly-silent ones skipped), handed to the engine at once so it works
+/// on several windows together. Each window's words reach the progress screen as soon as it
+/// and those before it are done. A GPU that fails mid-way leaves the windows still to do to
+/// the CPU.
+fn transcribe_with_engine(
+    wav: &Path,
+    path: &Path,
+    model: &models::SpeechModel,
+    progress: &Progress,
+) -> Result<(Vec<Cue>, String, String)> {
+    let mut transcriber = load_engine(path, progress)?;
+    let window = window_samples(transcriber.max_audio_ms().into());
+    let mut reader = hound::WavReader::open(wav)?;
+    ensure!(
+        reader.spec().sample_rate as usize == RATE,
+        "Unsupported speech sample rate"
+    );
+    let pcm = reader
+        .samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / 32768.))
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = pcm.len().max(1);
+    let speaking: Vec<Range<usize>> = windows(&pcm, window)
+        .into_iter()
+        .filter(|r| pcm[r.clone()].iter().any(|s| *s != 0.))
+        .collect();
+    // Parakeet Unified is English only: there's nothing to detect.
+    let language = "en";
+    let options = EngineRunOptions {
+        language: Some(language.into()),
+    };
+    let token = progress.token();
+    let stop = || token.is_cancelled();
+    let mut cues = Vec::new();
+    // Windows of `speaking` whose words are in `cues`.
+    let mut done = 0;
+    progress.stage(Stage::Transcribe)?;
+    while done < speaking.len() {
+        let rest: Vec<&[f32]> = speaking[done..].iter().map(|r| &pcm[r.clone()]).collect();
+        // An error of the app's own (a cancelled job) stops the engine, and is what's reported.
+        let mut failed = None;
+        let ran = transcriber.run_each(&rest, &options, &mut NoTrace, &stop, &mut |_, result| {
+            let range = &speaking[done];
+            let words = result.words.into_iter().map(|w| (w.t0_ms, w.t1_ms, w.text));
+            let added = add_window(
+                &mut cues,
+                range.start,
+                range.len(),
+                words,
+                result.text,
+                progress,
+            )
+            .and_then(|()| progress.fraction(range.end as f32 / total as f32));
+            done += 1;
+            added.map_err(|error| {
+                failed = Some(error);
+                EngineError::Cancelled
+            })
+        });
+        match (ran, failed) {
+            (Ok(()), _) => {}
+            (Err(_), Some(error)) => return Err(error),
+            (Err(EngineError::Cancelled), None) => {
+                progress.check()?;
+                anyhow::bail!("Cancelled");
+            }
+            (Err(error), None) if transcriber.gpu().is_some() => {
+                progress.note("Switching to the CPU…")?;
+                progress.update(Update::Device("CPU".into()))?;
+                drop(transcriber);
+                let cpu = EngineOptions {
+                    device: Device::Cpu,
+                };
+                transcriber = Transcriber::load(path, &cpu)
+                    .with_context(|| format!("CPU fallback failed after {error}"))?;
+            }
+            (Err(error), None) => return Err(error).context("Speech recognition failed"),
+        }
+    }
+    progress.fraction(1.)?;
+    Ok((cues, model.name.into(), language.into()))
 }
 
 pub fn label_speakers(

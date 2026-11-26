@@ -4016,6 +4016,7 @@ dependencies = [
  "transcribe-cpp",
  "ureq",
  "url",
+ "vellum-engine",
  "wgpu",
  "winresource",
 ]
@@ -4026,6 +4027,7 @@ version = "0.0.0"
 dependencies = [
  "half",
  "memmap2",
+ "miniz_oxide 0.8.9",
  "rayon",
  "rustfft",
  "serde",
