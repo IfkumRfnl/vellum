@@ -13,7 +13,7 @@ pub(crate) mod rounding;
 mod subsampling;
 
 use super::HParams;
-use crate::{Result, Trace, cpu::Mat, gguf::Gguf, trace::checkpoint};
+use crate::{Error, Result, Trace, cpu::Mat, gguf::Gguf, trace::checkpoint};
 use block::Block;
 use subsampling::Subsampling;
 
@@ -28,7 +28,7 @@ pub struct Encoder {
 impl Encoder {
     pub fn load(file: &Gguf, hparams: &HParams) -> Result<Encoder> {
         if hparams.subsampling_factor != 8 {
-            return Err(crate::Error::Unsupported(format!(
+            return Err(Error::Unsupported(format!(
                 "Parakeet with {}× subsampling",
                 hparams.subsampling_factor
             )));
@@ -42,7 +42,7 @@ impl Encoder {
             .iter()
             .any(|c| c.is_some() && *c != centred)
         {
-            return Err(crate::Error::Unsupported(
+            return Err(Error::Unsupported(
                 "Parakeet with a causal convolution module".into(),
             ));
         }
@@ -65,9 +65,21 @@ impl Encoder {
     /// frames are the ones the encoder sees: the reference drops the mel's trailing
     /// centering-pad frame (keeping `Mel::valid_frames`) after its `enc.mel.in` dump.
     pub fn forward(&self, mel: &Mat, trace: &mut dyn Trace) -> Mat {
+        never_stopped(self.forward_until(mel, trace, &|| false))
+    }
+
+    /// [`forward`](Self::forward), polling `stop` between conformer blocks (a tenth of a
+    /// second or so each for a full window on the CPU): once it says so, the encoder gives up
+    /// with [`Error::Cancelled`] instead of finishing the window.
+    pub fn forward_until(
+        &self,
+        mel: &Mat,
+        trace: &mut dyn Trace,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Mat> {
         let mut x = self.subsample(mel);
         checkpoint(trace, "enc.pre_encode.out", &mut x);
-        self.conformer(x, trace)
+        self.conformer_until(x, trace, stop)
     }
 
     /// The 8× subsampling alone: mel features (`num_mels` × frames) to ⌈frames / 8⌉ ×
@@ -80,7 +92,17 @@ impl Encoder {
     /// positional encodings of the frames given, every block. Streaming Sortformer runs it on
     /// its speaker cache and newest chunk joined, which [`subsample`](Self::subsample) made
     /// apart.
-    pub fn conformer(&self, mut x: Mat, trace: &mut dyn Trace) -> Mat {
+    pub fn conformer(&self, x: Mat, trace: &mut dyn Trace) -> Mat {
+        never_stopped(self.conformer_until(x, trace, &|| false))
+    }
+
+    /// [`conformer`](Self::conformer), polling `stop` before each block.
+    pub fn conformer_until(
+        &self,
+        mut x: Mat,
+        trace: &mut dyn Trace,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Mat> {
         if self.xscale != 1. {
             let s = self.xscale;
             x.map(|v| v * s);
@@ -88,10 +110,18 @@ impl Encoder {
         let mut pos = positional_encodings(x.rows, self.d_model);
         checkpoint(trace, "enc.pos_emb", &mut pos);
         for (l, block) in self.blocks.iter().enumerate() {
+            if stop() {
+                return Err(Error::Cancelled);
+            }
             x = block.forward(x, &pos, l, trace);
         }
-        x
+        Ok(x)
     }
+}
+
+/// The result of a run whose stop check never says to stop.
+fn never_stopped(result: Result<Mat>) -> Mat {
+    result.unwrap_or_else(|_| unreachable!("only a stop check fails the encoder"))
 }
 
 /// The sinusoidal encodings of every relative position a window of `frames` frames has, from

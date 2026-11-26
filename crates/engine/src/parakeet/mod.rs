@@ -148,8 +148,20 @@ impl Parakeet {
     pub fn run(
         &self,
         pcm: &[f32],
+        options: &RunOptions,
+        trace: &mut dyn Trace,
+    ) -> Result<Transcript> {
+        self.run_until(pcm, options, trace, &|| false)
+    }
+
+    /// [`run`](Self::run), with `stop` polled between the CPU encoder's blocks (a window there
+    /// takes seconds); once it says so, the run returns [`Error::Cancelled`].
+    fn run_until(
+        &self,
+        pcm: &[f32],
         _options: &RunOptions,
         trace: &mut dyn Trace,
+        stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<Transcript> {
         let mut timings = Timings::default();
         let start = Instant::now();
@@ -166,7 +178,7 @@ impl Parakeet {
                     Encoder::Gpu(_, gpu) => gpu
                         .encode_traced(std::slice::from_ref(&mel), trace)?
                         .remove(0),
-                    Encoder::Cpu(cpu) => cpu.forward(&mel, trace),
+                    Encoder::Cpu(cpu) => cpu.forward_until(&mel, trace, stop)?,
                 }
             };
             checkpoint(trace, "enc.final", &mut encoded);
@@ -176,7 +188,7 @@ impl Parakeet {
             match &self.encoder {
                 // The projection is the GPU encoder's last multiply, as in the pipeline.
                 Encoder::Gpu(_, gpu) => gpu.encode_projected(std::slice::from_ref(&mel))?.remove(0),
-                Encoder::Cpu(cpu) => self.decoder.project(&cpu.forward(&mel, trace)),
+                Encoder::Cpu(cpu) => self.decoder.project(&cpu.forward_until(&mel, trace, stop)?),
             }
         };
         timings.encode_ms = start.elapsed().as_secs_f64() * 1e3;
@@ -199,7 +211,8 @@ impl Parakeet {
     /// Every window of a recording, in order, each with exactly the result [`run`](Self::run)
     /// gives it, but with mel, encoder and decoder working on different windows at once (see
     /// [`pipeline`](Self::pipeline)); each handed to `each` as soon as it and the windows
-    /// before it are done. `stop` is polled between windows and batches. A trace that records
+    /// before it are done. `stop` is polled between windows and batches, and on the CPU between
+    /// the encoder's blocks. A trace that records
     /// or substitutes tensors gets the windows one by one instead, so its checkpoints keep
     /// their meaning.
     pub fn run_each(
@@ -216,7 +229,7 @@ impl Parakeet {
                 if stop() {
                     return Err(Error::Cancelled);
                 }
-                each(index, self.run(pcm, options, trace)?)?;
+                each(index, self.run_until(pcm, options, trace, stop)?)?;
             }
             return Ok(());
         }
@@ -229,6 +242,7 @@ impl Parakeet {
                 &mut CpuEncoder {
                     model: self,
                     encoder,
+                    stop,
                 },
                 stop,
                 each,

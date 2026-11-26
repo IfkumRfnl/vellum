@@ -177,9 +177,16 @@ impl Sortformer {
         })
     }
 
-    /// A whole recording of 16 kHz audio to speaker turns.
-    pub fn run(&self, pcm: &[f32], trace: &mut dyn Trace) -> Result<Vec<SpeakerTurn>> {
-        let mut probs = self.probabilities(pcm, trace)?;
+    /// A whole recording of 16 kHz audio to speaker turns. `stop` is polled before every
+    /// chunk (and on the CPU between the encoder's blocks); once it says so, the run returns
+    /// [`Error::Cancelled`].
+    pub fn run(
+        &self,
+        pcm: &[f32],
+        trace: &mut dyn Trace,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<SpeakerTurn>> {
+        let mut probs = self.probabilities(pcm, trace, stop)?;
         checkpoint(trace, "diar.probs", &mut probs);
         Ok(turns(&probs, self.hparams.frame_ms()))
     }
@@ -207,8 +214,21 @@ impl Sortformer {
         chunks
     }
 
+    /// The GPU the model runs on, if it runs on one.
+    pub fn gpu(&self) -> Option<&crate::gpu::Gpu> {
+        match &self.backend {
+            Backend::Cpu { .. } => None,
+            Backend::Gpu(g) => Some(&g.gpu),
+        }
+    }
+
     /// The speaker probabilities of every 80 ms frame (frames × speakers), streamed.
-    fn probabilities(&self, pcm: &[f32], trace: &mut dyn Trace) -> Result<Mat> {
+    fn probabilities(
+        &self,
+        pcm: &[f32],
+        trace: &mut dyn Trace,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Mat> {
         let n_spk = self.hparams.max_speakers;
         let sub = self.hparams.encoder.subsampling_factor;
         // NeMo's Sortformer frames the audio as ⌈n / hop⌉ (no trailing centering frame).
@@ -254,6 +274,9 @@ impl Sortformer {
                     .recv()
                     .map_err(|_| Error::Other("subsampling stopped".into()))??;
                 for (i, (chunk, embs)) in group.iter().zip(&embs).enumerate() {
+                    if stop() {
+                        return Err(Error::Cancelled);
+                    }
                     let concat = state.concat(embs);
                     trace.event(
                         "sortformer.chunk",
@@ -264,7 +287,7 @@ impl Sortformer {
                             "frames": embs.rows, "concat": concat.rows,
                         }),
                     );
-                    let preds = self.predict(concat)?;
+                    let preds = self.predict(concat, stop)?;
                     state.update(&params, embs, &preds, (chunk.lc, chunk.rc), trace);
                 }
             }
@@ -293,13 +316,13 @@ impl Sortformer {
 
     /// Speaker probabilities (frames × speakers) for pre-encode embeddings (frames × 512):
     /// the x-scaling, the conformer blocks, the projection, the transformer and the head.
-    fn predict(&self, embs: Mat) -> Result<Mat> {
+    fn predict(&self, embs: Mat, stop: &(dyn Fn() -> bool + Sync)) -> Result<Mat> {
         match &self.backend {
             Backend::Cpu {
                 encoder,
                 transformer,
             } => {
-                let x = encoder.conformer(embs, &mut NoTrace);
+                let x = encoder.conformer_until(embs, &mut NoTrace, stop)?;
                 let t = transformer.encode(transformer.project(&x));
                 Ok(transformer.speakers(&t))
             }

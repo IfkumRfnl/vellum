@@ -16,6 +16,7 @@ pub fn load(job: &Job) -> Result<Box<dyn Engine>> {
             DeviceRequest::Cpu => Device::Cpu,
             DeviceRequest::Gpu => Device::Gpu,
         },
+        ..Options::default()
     };
     let trace = LabTrace::new(job)?;
     Ok(match &job.task {

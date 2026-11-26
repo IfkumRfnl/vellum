@@ -17,7 +17,7 @@ pub mod trace;
 pub mod whisper;
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 pub use trace::{NoTrace, Trace};
 
 /// The sample rate every model takes.
@@ -54,6 +54,11 @@ pub enum Device {
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub device: Device,
+    /// Where a GPU keeps its compiled kernels between runs (Vulkan's pipeline cache, one file
+    /// per adapter and driver), so loading a model again can skip the driver's compiles
+    /// (NVIDIA's driver keeps a cache of its own, so there it saves little). `None`: compile
+    /// them every time.
+    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,9 +133,13 @@ fn architecture(path: &Path) -> Result<(gguf::Gguf, String)> {
 /// The GPU a model runs on, by the request: none for `Cpu`; the best adapter for `Gpu`
 /// (an error if there's none); for `Auto`, the best adapter only if it's a discrete card or
 /// Apple's (an integrated GPU elsewhere is often slower than the CPU — this laptop's is), unless
-/// `VELLUM_GPU` names one.
-fn gpu(device: Device) -> Result<Option<std::sync::Arc<gpu::Gpu>>> {
-    let options = gpu::GpuOptions::from_env();
+/// `VELLUM_GPU` names one. Its kernels are cached in the options' `cache_dir`, if any.
+fn gpu(options: &Options) -> Result<Option<std::sync::Arc<gpu::Gpu>>> {
+    let device = options.device;
+    let options = gpu::GpuOptions {
+        cache_dir: options.cache_dir.clone(),
+        ..gpu::GpuOptions::from_env()
+    };
     match device {
         Device::Cpu => Ok(None),
         Device::Gpu => Ok(Some(std::sync::Arc::new(gpu::Gpu::new(&options)?))),
@@ -194,6 +203,15 @@ fn keep_full_speed() {
 #[cfg(not(windows))]
 fn keep_full_speed() {}
 
+/// Writes the kernels a model just compiled at load to the pipeline cache, when there is one
+/// (`Options::cache_dir`). A cache that can't be written only costs the next load its
+/// compiles, so a failure is ignored.
+fn keep_kernels(gpu: Option<&gpu::Gpu>) {
+    if let Some(gpu) = gpu {
+        let _ = gpu.save_pipeline_cache();
+    }
+}
+
 /// A speech model, loaded.
 pub struct Transcriber {
     model: SpeechModel,
@@ -212,13 +230,13 @@ impl Transcriber {
         keep_full_speed();
         let (file, arch) = architecture(path)?;
         let model = match arch.as_str() {
-            "parakeet" => {
-                SpeechModel::Parakeet(parakeet::Parakeet::load(&file, gpu(options.device)?)?)
-            }
+            "parakeet" => SpeechModel::Parakeet(parakeet::Parakeet::load(&file, gpu(options)?)?),
             "whisper" => SpeechModel::Whisper(whisper::Whisper::load(&file)?),
             _ => return Err(Error::Unsupported(arch)),
         };
-        Ok(Transcriber { model })
+        let transcriber = Transcriber { model };
+        keep_kernels(transcriber.gpu());
+        Ok(transcriber)
     }
 
     pub fn info(&self) -> &ModelInfo {
@@ -310,11 +328,13 @@ impl Diarizer {
         let (file, arch) = architecture(path)?;
         let model = match arch.as_str() {
             "sortformer" => {
-                SpeakerModel::Sortformer(sortformer::Sortformer::load(&file, gpu(options.device)?)?)
+                SpeakerModel::Sortformer(sortformer::Sortformer::load(&file, gpu(options)?)?)
             }
             _ => return Err(Error::Unsupported(arch)),
         };
-        Ok(Diarizer { model })
+        let diarizer = Diarizer { model };
+        keep_kernels(diarizer.gpu());
+        Ok(diarizer)
     }
 
     pub fn info(&self) -> &ModelInfo {
@@ -325,8 +345,28 @@ impl Diarizer {
 
     /// A whole recording of 16 kHz mono audio to speaker turns.
     pub fn run(&mut self, pcm: &[f32], trace: &mut dyn Trace) -> Result<Vec<SpeakerTurn>> {
+        self.run_until(pcm, trace, &|| false)
+    }
+
+    /// [`run`](Self::run) for an app: `stop` is polled between the recording's chunks (half
+    /// a minute of audio each; on the CPU also inside them, between the encoder's blocks).
+    /// Once it says so, the run gives up within a fraction of a second and returns
+    /// [`Error::Cancelled`].
+    pub fn run_until(
+        &mut self,
+        pcm: &[f32],
+        trace: &mut dyn Trace,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<SpeakerTurn>> {
         match &self.model {
-            SpeakerModel::Sortformer(m) => m.run(pcm, trace),
+            SpeakerModel::Sortformer(m) => m.run(pcm, trace, stop),
+        }
+    }
+
+    /// The GPU the model runs on, if it runs on one.
+    pub fn gpu(&self) -> Option<&gpu::Gpu> {
+        match &self.model {
+            SpeakerModel::Sortformer(m) => m.gpu(),
         }
     }
 }

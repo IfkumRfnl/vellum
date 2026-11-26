@@ -10,7 +10,7 @@ use transcribe_cpp::{
     SortformerDiarizeOptions, SortformerPreset, SpeakerSegment, TimestampKind,
 };
 use vellum_engine::{
-    Device, Error as EngineError, NoTrace, Options as EngineOptions,
+    Device, Diarizer, Error as EngineError, NoTrace, Options as EngineOptions,
     RunOptions as EngineRunOptions, Transcriber,
 };
 
@@ -49,13 +49,30 @@ fn speech_devices() -> Result<()> {
     Ok(())
 }
 
-/// Whether Parakeet runs on Vellum's own engine (`crates/engine`), which gives transcribe.cpp's
-/// transcripts about three times as fast. `VELLUM_ENGINE=cpp` switches it back to
-/// transcribe.cpp, to compare the two. The Whisper models stay on transcribe.cpp until their
-/// port lands.
-fn own_engine(model: &models::SpeechModel) -> bool {
-    model.id == "parakeet_unified_en"
-        && !std::env::var("VELLUM_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("cpp"))
+/// Whether Vellum's own engine (`crates/engine`) runs what it can: Parakeet, which it
+/// transcribes as transcribe.cpp does about three times as fast, and the speaker labels
+/// (Sortformer, the same turns about three times as fast). `VELLUM_ENGINE=cpp` switches both
+/// back to transcribe.cpp, to compare the two.
+fn own_engine() -> bool {
+    !std::env::var("VELLUM_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("cpp"))
+}
+
+/// Whether a speech model runs on Vellum's engine. The Whisper models stay on transcribe.cpp
+/// until their port lands.
+fn own_speech_engine(model: &models::SpeechModel) -> bool {
+    model.id == "parakeet_unified_en" && own_engine()
+}
+
+/// How Vellum's engine loads a model on `device`: with the GPU's compiled kernels kept in
+/// Vellum's own cache folder (`%LOCALAPPDATA%\Vellum\cache\gpu` on Windows), so a model loads
+/// without the driver's compiles after the first time. They are specific to the machine's GPU
+/// and driver, so they live in the local cache rather than with the settings, which roam.
+fn engine_options(device: Device) -> EngineOptions {
+    EngineOptions {
+        device,
+        cache_dir: directories::ProjectDirs::from("", "", "Vellum")
+            .map(|dirs| dirs.cache_dir().join("gpu")),
+    }
 }
 
 // Look for the quietest 40 ms near the end of a full window.
@@ -147,7 +164,7 @@ pub fn transcribe(
     progress.stage(Stage::Model)?;
     let path = model.artifact.get(cache, progress)?;
     progress.update(Update::Estimated)?;
-    if own_engine(model) {
+    if own_speech_engine(model) {
         return transcribe_with_engine(wav, &path, model, progress);
     }
     speech_devices()?;
@@ -232,7 +249,7 @@ pub fn transcribe(
 /// can't take the model) on the CPU. Names the device on the progress screen as the
 /// transcribe.cpp path does ("Vulkan · NVIDIA GeForce RTX 4060 Laptop GPU", "CPU").
 fn load_engine(path: &Path, progress: &Progress) -> Result<Transcriber> {
-    let load = |device| Transcriber::load(path, &EngineOptions { device });
+    let load = |device| Transcriber::load(path, &engine_options(device));
     let transcriber = match load(Device::Auto) {
         // A file the engine can't read fails the same way on the CPU.
         Err(error @ (EngineError::Io(_) | EngineError::Gguf(_) | EngineError::Unsupported(_))) => {
@@ -244,15 +261,15 @@ fn load_engine(path: &Path, progress: &Progress) -> Result<Transcriber> {
         }
         Ok(transcriber) => transcriber,
     };
-    progress.update(Update::Device(engine_device(&transcriber)))?;
+    progress.update(Update::Device(engine_device(transcriber.gpu())))?;
     Ok(transcriber)
 }
 
 /// The device a model runs on as the progress screen names it: the graphics API and the GPU,
 /// or "CPU".
-fn engine_device(transcriber: &Transcriber) -> String {
+fn engine_device(gpu: Option<&vellum_engine::gpu::Gpu>) -> String {
     use vellum_engine::gpu::wgpu::Backend;
-    let Some(gpu) = transcriber.gpu() else {
+    let Some(gpu) = gpu else {
         return "CPU".into();
     };
     let api = match gpu.info.backend {
@@ -336,10 +353,7 @@ fn transcribe_with_engine(
                 progress.note("Switching to the CPU…")?;
                 progress.update(Update::Device("CPU".into()))?;
                 drop(transcriber);
-                let cpu = EngineOptions {
-                    device: Device::Cpu,
-                };
-                transcriber = Transcriber::load(path, &cpu)
+                transcriber = Transcriber::load(path, &engine_options(Device::Cpu))
                     .with_context(|| format!("CPU fallback failed after {error}"))?;
             }
             (Err(error), None) => return Err(error).context("Speech recognition failed"),
@@ -358,7 +372,6 @@ pub fn label_speakers(
     progress.stage(Stage::Speakers)?;
     let path = models::SPEAKERS.get(cache, progress)?;
     progress.update(Update::Estimated)?;
-    speech_devices()?;
     let mut audio = hound::WavReader::open(wav)?;
     ensure!(
         audio.spec().sample_rate as usize == RATE,
@@ -368,9 +381,25 @@ pub fn label_speakers(
         .samples::<i16>()
         .map(|s| s.map(|v| v as f32 / 32768.))
         .collect::<Result<Vec<_>, _>>()?;
+    let segments = if own_engine() {
+        diarize_with_engine(&path, &samples, progress)?
+    } else {
+        diarize_with_cpp(&path, &samples, progress)?
+    };
+    assign_speakers(cues, &turns(segments));
+    Ok(())
+}
+
+/// Speaker segments from transcribe.cpp's Sortformer, on the GPU when it can, else the CPU.
+fn diarize_with_cpp(
+    path: &Path,
+    samples: &[f32],
+    progress: &Progress,
+) -> Result<Vec<SpeakerSegment>> {
+    speech_devices()?;
     let diarize = |backend| -> transcribe_cpp::Result<Vec<SpeakerSegment>> {
         let model = Model::load_with(
-            &path,
+            path,
             &ModelOptions {
                 backend,
                 ..Default::default()
@@ -382,7 +411,7 @@ pub fn label_speakers(
         // ten times faster than the default real-time one (two hours in 21 s against 207 s).
         let preset = Some(SortformerPreset::VeryHighLatency);
         session.run(
-            &samples,
+            samples,
             &DiarizeOptions {
                 family: Some(DiarizeExtension::Sortformer(SortformerDiarizeOptions {
                     preset,
@@ -390,15 +419,68 @@ pub fn label_speakers(
             },
         )
     };
-    let segments = match diarize(Backend::Auto) {
+    Ok(match diarize(Backend::Auto) {
         Err(error) if device_error(&error) => {
             progress.note("Switching to the CPU…")?;
             diarize(Backend::Cpu).with_context(|| format!("CPU fallback failed after {error}"))?
         }
         result => result.context("Speaker analysis failed")?,
+    })
+}
+
+/// Speaker segments from Sortformer on Vellum's engine, which streams the recording in
+/// half-minute chunks as transcribe.cpp's offline preset does: on the GPU when there's a good
+/// one, else (or when the GPU fails, at load or mid-way) on the CPU. The device goes to the
+/// progress screen; a cancelled job stops it between chunks.
+fn diarize_with_engine(
+    path: &Path,
+    samples: &[f32],
+    progress: &Progress,
+) -> Result<Vec<SpeakerSegment>> {
+    let load = |device| Diarizer::load(path, &engine_options(device));
+    let mut diarizer = match load(Device::Auto) {
+        // A file the engine can't read fails the same way on the CPU.
+        Err(error @ (EngineError::Io(_) | EngineError::Gguf(_) | EngineError::Unsupported(_))) => {
+            return Err(error).context("Could not load the speaker model");
+        }
+        Err(error) => {
+            progress.note("Switching to the CPU…")?;
+            load(Device::Cpu).with_context(|| format!("CPU fallback failed after {error}"))?
+        }
+        Ok(diarizer) => diarizer,
     };
-    assign_speakers(cues, &turns(segments));
-    Ok(())
+    progress.update(Update::Device(engine_device(diarizer.gpu())))?;
+    let token = progress.token();
+    let stop = || token.is_cancelled();
+    let mut ran = diarizer.run_until(samples, &mut NoTrace, &stop);
+    if let Err(error) = &ran
+        && !matches!(error, EngineError::Cancelled)
+        && diarizer.gpu().is_some()
+    {
+        // The stream's state is on the GPU: the CPU starts the recording over.
+        progress.note("Switching to the CPU…")?;
+        progress.update(Update::Device("CPU".into()))?;
+        drop(diarizer);
+        let mut cpu =
+            load(Device::Cpu).with_context(|| format!("CPU fallback failed after {error}"))?;
+        ran = cpu.run_until(samples, &mut NoTrace, &stop);
+    }
+    let speaker_turns = match ran {
+        Err(EngineError::Cancelled) => {
+            progress.check()?;
+            anyhow::bail!("Cancelled");
+        }
+        result => result.context("Speaker analysis failed")?,
+    };
+    Ok(speaker_turns
+        .into_iter()
+        .map(|t| SpeakerSegment {
+            t0_ms: t.t0_ms,
+            t1_ms: t.t1_ms,
+            speaker_id: t.speaker,
+            p: t.p,
+        })
+        .collect())
 }
 
 /// The least a voice is heard in the whole video to count as a speaker. The model also

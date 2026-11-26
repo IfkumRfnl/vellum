@@ -55,10 +55,12 @@ pub trait EncoderStage {
 }
 
 /// The CPU encoder and the joint's encoder projection, one window at a time, on the global
-/// rayon pool (every core: it's where the time goes).
+/// rayon pool (every core: it's where the time goes). A window takes seconds, so the stop
+/// check is also polled between its blocks.
 pub struct CpuEncoder<'a> {
     pub model: &'a Parakeet,
     pub encoder: &'a super::encoder::Encoder,
+    pub stop: &'a (dyn Fn() -> bool + Sync),
 }
 
 impl EncoderStage for CpuEncoder<'_> {
@@ -71,13 +73,12 @@ impl EncoderStage for CpuEncoder<'_> {
     }
 
     fn submit(&mut self, mels: Vec<Mat>) -> Result<Vec<Mat>> {
-        Ok(mels
-            .iter()
+        mels.iter()
             .map(|mel| {
-                let encoded = self.encoder.forward(mel, &mut NoTrace);
-                self.model.decoder.project(&encoded)
+                let encoded = self.encoder.forward_until(mel, &mut NoTrace, self.stop)?;
+                Ok(self.model.decoder.project(&encoded))
             })
-            .collect())
+            .collect()
     }
 
     fn flush(&mut self) -> Result<Vec<Mat>> {
