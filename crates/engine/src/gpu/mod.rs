@@ -30,6 +30,12 @@ use wgpu::util::DeviceExt;
 /// Every embedded shader, for the pipeline cache's key: a changed shader starts a new cache.
 const SHADERS: &[&str] = &[gemm::SIMT_SOURCE, gemm::COOP_SOURCE];
 
+/// Bytes of initialized buffers between flushes while a model loads. wgpu stages each
+/// buffer's contents in host memory until the next submit completes, so without flushes a
+/// model's whole weights (1.3 GB for Whisper Turbo in f16) would sit in RAM twice over
+/// during load.
+const UPLOAD_FLUSH_BYTES: u64 = 128 << 20;
+
 /// How to pick and drive the device.
 #[derive(Debug, Clone, Default)]
 pub struct GpuOptions {
@@ -111,6 +117,11 @@ pub struct Gpu {
     kernels: Mutex<HashMap<String, Arc<Kernel>>>,
     bind_groups: Mutex<HashMap<(u64, Vec<u64>), wgpu::BindGroup>>,
     next_id: AtomicU64,
+    /// Bytes uploaded since the last flush (see [`UPLOAD_FLUSH_BYTES`]).
+    unflushed: AtomicU64,
+    /// The first failure nobody scoped (out of memory, the device lost), reported by the next
+    /// wait or readback (see [`check`](Self::check)).
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 /// The usual case — no adapter or backend asked for — without starting every backend: listing
@@ -210,9 +221,29 @@ impl Gpu {
             trace: wgpu::Trace::Off,
         }))
         .map_err(|e| Error::Other(format!("GPU device on {}: {e}", info.name)))?;
-        // wgpu's default panics on an error nobody scoped; the engine reports it and goes on
-        // (kernel creation scopes its own errors and returns them).
-        device.on_uncaptured_error(std::sync::Arc::new(|e| eprintln!("GPU error: {e}")));
+        // wgpu's default panics on an error nobody scoped. The engine keeps the first one for
+        // the next wait or readback to return (an out-of-memory leaves buffers invalid, so the
+        // work after it is wrong), and prints the rest (kernel creation and model loads scope
+        // their own errors and return them).
+        let failure = Arc::new(Mutex::new(None::<String>));
+        let first = failure.clone();
+        device.on_uncaptured_error(Arc::new(move |e| {
+            eprintln!("GPU error: {e}");
+            let mut first = first.lock().unwrap_or_else(|e| e.into_inner());
+            if first.is_none() {
+                *first = Some(match e {
+                    wgpu::Error::OutOfMemory { .. } => "GPU out of memory".to_owned(),
+                    e => format!("GPU error: {e}"),
+                });
+            }
+        }));
+        let lost = failure.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            if reason != wgpu::DeviceLostReason::Destroyed {
+                let mut lost = lost.lock().unwrap_or_else(|e| e.into_inner());
+                lost.get_or_insert(format!("GPU device lost: {message}"));
+            }
+        });
         let cooperative_matrices = if experimental {
             adapter.cooperative_matrix_properties()
         } else {
@@ -248,6 +279,8 @@ impl Gpu {
             kernels: Mutex::default(),
             bind_groups: Mutex::default(),
             next_id: AtomicU64::new(1),
+            unflushed: AtomicU64::new(0),
+            failure,
         })
     }
 
@@ -357,11 +390,52 @@ impl Gpu {
                 mapped_at_creation: false,
             }),
         };
+        if bytes.is_some()
+            && self.unflushed.fetch_add(size, Ordering::Relaxed) + size > UPLOAD_FLUSH_BYTES
+        {
+            self.flush_uploads();
+        }
         Tensor {
             buffer,
             len,
             dtype,
             id: self.id(),
+        }
+    }
+
+    /// Submits the uploads so far and waits for them, which frees their staging memory.
+    pub fn flush_uploads(&self) {
+        self.unflushed.store(0, Ordering::Relaxed);
+        self.queue.submit([]);
+        // A failure here shows up at the next wait or readback.
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    /// The failure nobody scoped since the last check, as an error (cleared once reported).
+    pub fn check(&self) -> Result<()> {
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            Some(failure) => Err(Error::Other(failure)),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs `f` (allocations: a model's load) with out-of-memory errors scoped: an allocation
+    /// the device can't make fails `f`'s result instead of leaving an invalid buffer.
+    pub fn allocating<T>(&self, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let result = f();
+        self.flush_uploads();
+        match block_on(scope.pop()) {
+            Some(e) => Err(Error::Other(format!(
+                "GPU out of memory loading {what} on {}: {e}",
+                self.info.name
+            ))),
+            None => result,
         }
     }
 
@@ -442,10 +516,13 @@ impl Gpu {
 
     /// Blocks until the GPU has finished all submitted work.
     pub fn wait(&self) -> Result<()> {
-        self.device
+        let polled = self
+            .device
             .poll(wgpu::PollType::wait_indefinitely())
             .map(drop)
-            .map_err(|e| Error::Other(format!("GPU: {e}")))
+            .map_err(|e| Error::Other(format!("GPU: {e}")));
+        self.check()?;
+        polled
     }
 
     /// A compute kernel: `source` (WGSL) with `consts` prepended as `const NAME: u32 = V;`,

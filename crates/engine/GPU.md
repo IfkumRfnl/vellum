@@ -138,9 +138,28 @@ weights for the tensor cores, everything else f32; a window's result never depen
   oracle's own code and seeded generator; its prompt's keys and values are reused from the first
   attempt, and language detection's step is the first attempt's first.
 - **Pipeline** (`whisper/pipeline.rs`, `run_each`): mel features on their own thread, encoder
-  batches (4) between decoder runs, eight decoder slots; a window keeps its slot through its
+  batches between decoder runs, eight decoder slots; a window keeps its slot through its
   passes and attempts. Without a language only the first unfinished window decodes until one has
-  text (the app's rule), so results are exactly `run`'s window by window.
+  text (the app's rule), so results are exactly `run`'s window by window: the quick tier's 612
+  clips per model give the same tokens, probabilities and times either way
+  (`VELLUM_WHISPER_SEQUENTIAL=1` for the window-by-window path).
+- **Memory, allocated once per model**: encoder arenas, decoder slots and caches, the decoder's
+  three readback buffers; a run allocates nothing but wgpu's command buffers and upload staging.
+  An encoder batch costs the same per window at any size, so its activations get a budget (192
+  MiB: 4 windows for Small, 2 for Turbo). Uploads are flushed every 128 MB during a load (wgpu
+  otherwise keeps every buffer's staging copy in RAM until the first submit: the whole f16
+  encoder twice over). A load's out-of-memory is an error (`Gpu::allocating`, an error scope);
+  any later one, or a lost device, is kept by the device and returned by the next wait or
+  readback (`Gpu::check`) instead of only printed.
+- **Mel**: frames of the 30 s padding are silence, power 0 in every bin, so they take the clamp's
+  value without an FFT (the same bits; a 2 s window's mel goes from 7 ms to under 1).
+
+On Windows the NVIDIA driver charges the device memory a process allocates to the system's
+commit: Turbo's 2.5 GB on the GPU shows as 2.7 GB of private bytes. With the commit nearly
+exhausted by other programs, either engine can fail to allocate (a 66 MB host allocation in a
+load, out of memory for the cross cache), which once failed every clip of a Turbo check.
+Over 612 recordings in one process: GPU memory in use 4.56 → 4.54 → 4.45 GB (start, middle,
+end), private bytes 2676 → 2725 → 2733 MB (the harness keeping each clip's output).
 
 Measured on the RTX 4060 Laptop GPU (`cargo lab whisper`, GPU timestamps):
 
@@ -148,30 +167,37 @@ Measured on the RTX 4060 Laptop GPU (`cargo lab whisper`, GPU timestamps):
 | --- | ---: | ---: |
 | encoder, ms per 30 s window (any batch) | 20 | 118 |
 | — of it matrix multiplies, attention | 13, 5.5 | 89, 27 |
-| decoder step, 1 window | 1.45 ms | 1.15 ms |
+| decoder step, 1 window | 1.10 ms | 1.15 ms (before the gemv change) |
 | decoder step, 8 windows (per window) | 3.8 ms (0.47) | 2.7 ms (0.33) |
-| a step past every window's end | 0.10 ms | 0.04 ms |
+| a step past every window's end | 0.09 ms | 0.04 ms |
 
 What bounds it: the encoder's multiplies run at 21–22 TFLOP/s, about 92% of the 4060's f16
 tensor-core rate with f32 accumulation (24 SMs × 512 FLOP/clock × ~1.9 GHz). The reference gets
 its encoder speed differently: it quantizes activations to 8 bits and multiplies on int8 tensor
-cores, which wgpu doesn't expose (the adapter lists f16 cooperative matrices only); f16
-accumulation (F16→F16) measured no faster. A one-window decoder step is its ~110 (Small) or ~40
-(Turbo) dependent dispatches, each a few microseconds of launch and drain, plus 150–200 MB of
-weights and encoder keys and values. Eight windows in lockstep are bound by their encoder keys
-and values (55 MB per window per step for Small).
+cores, which wgpu doesn't expose (its cooperative-matrix types are f32, f16, i32 and u32); f16
+accumulation (F16→F16) measured no faster. Encoding less than 30 s isn't exact: the encoder's
+attention is global, so every position depends on the padding, and the reference always encodes
+all 3000 frames. A one-window decoder step streams Small's 139 MB of Q8 weights and 55 MB of
+encoder keys and values (a 0.86 ms floor at ~225 GB/s; 1.10 ms measured). The gemv kernel is
+compiled per window count (1, 2, 4, 8), so one window keeps 4 accumulators per lane, not 32:
+`gemv/head` went from ~45 to ~225 GB/s, with each output summed exactly as before. Eight
+windows in lockstep are bound by their encoder keys and values (cross-attention 1.85 ms of a
+3.8 ms Small step) and by the gemv re-reading x per row.
 
 Against the reference (`cargo lab bench --tier quick --models small,turbo --a ref --b vellum
---blocks 4`, which runs each window through `run` as the app's harness does without a language):
-median speedup 1.49× for Small (95% interval 1.38–1.55), 1.32× for Turbo (1.30–1.34); short
-clips are their 30 s encoder pass and a few dozen decoder steps (Small 51–71 ms against 83–106,
-Turbo 144–163 ms against 196–218). With the pipeline, a long recording's windows decode in
-lockstep: 1.6–2× `run` window by window (`cargo lab whisper`'s pipeline check), which the
-harness doesn't exercise for a detecting model (it calls `transcribe` per window when no
-language is given).
+--blocks 4`, whole recordings through `run_each`): median speedup 1.91× for Small (95% interval
+1.85–2.33; every clip faster; short clips 1.69–1.94×, long recordings 2.47–2.72×), 1.45× for
+Turbo (1.43–1.49; short clips 1.39–1.52×, two chapters and the TED talk 1.62–1.92×, the
+18-minute earnings call 0.93×). Turbo's short clips are its 118 ms encoder pass, which the
+reference does in int8: they can't reach 2× without a faster multiply.
 
-Unexplained: now and then the encoder's multiplies alone run about ten times slower for a few
-seconds (GPU timestamps confirm it; attention and the decoder in the same windows don't slow,
-SM and memory clocks stay up, nothing is evicted to shared memory). It costs one bench clip
-(Turbo on `librispeech-other/chapter-1688-142285`, 12 s against the reference's 7.2 s in three
-of four jobs; 5.5–6.7 s run alone).
+The encoder's slow spells: running Turbo's encoder alone, back to back on the same input, its
+tensor-core kernels (the multiplies, sometimes attention) slow 10–19× in a fixed cycle after
+6–70 s of sustained load (seven batches fast, eight slow), clocks, P-state and power (the 80 W
+cap) unchanged, no hardware or thermal slowdown reported, memory controller 81% busy against
+29%. Nothing else uses the GPU then (per-process engine counters), nothing is demoted to shared
+memory, and it isn't the decoder, the pipeline, uploads, submit size or the tile shape (coop
+64×64×32 too; SIMT only later, at 40% of the speed). Small with batches of 8 does it too;
+Small's own batches (47 ms of work) almost never. In the bench it costs the long recordings:
+up to 40% of a Turbo job's encoder batches, the earnings call above. Unexplained below the API;
+the reference, lighter on the GPU, doesn't trigger it.

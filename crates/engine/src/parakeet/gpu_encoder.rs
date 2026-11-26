@@ -1430,12 +1430,20 @@ pub(crate) fn map_read(
     let slice = buffer.slice(..bytes);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| drop(tx.send(r)));
-    gpu.device
-        .poll(wgpu::PollType::Wait {
-            submission_index: submission,
-            timeout: None,
-        })
-        .map_err(|e| Error::Other(format!("GPU: {e}")))?;
+    let polled = gpu.device.poll(wgpu::PollType::Wait {
+        submission_index: submission,
+        timeout: None,
+    });
+    // An earlier failure (out of memory) explains a failed wait better than the wait does.
+    // Either way the map is cancelled, so a pooled staging buffer can be mapped again.
+    if let Some(e) = gpu
+        .check()
+        .err()
+        .or_else(|| polled.err().map(|e| Error::Other(format!("GPU: {e}"))))
+    {
+        buffer.unmap();
+        return Err(e);
+    }
     rx.recv()
         .map_err(|_| Error::Other("readback never mapped".into()))?
         .map_err(|e| Error::Other(format!("readback: {e}")))?;

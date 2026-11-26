@@ -97,6 +97,7 @@ impl LogMel {
         let frames = n / self.hop + 1;
         let n_freq = self.n_fft / 2 + 1;
         let mut log_mel = Mat::zeros(frames, self.num_mels);
+        let silent = 0f64.max(1e-10).log10() as f32;
         log_mel
             .data
             .par_chunks_mut(self.num_mels)
@@ -111,6 +112,13 @@ impl LogMel {
                 },
                 |(input, output, power), (t, row)| {
                     let frame = &padded[t * self.hop..][..self.n_fft];
+                    // A frame of silence (the padding to 30 s, most of a short window's) has
+                    // power 0 in every bin, so every value is the clamp's: the same bits the
+                    // FFT would give, without it.
+                    if frame.iter().all(|&s| s == 0.) {
+                        row.fill(silent);
+                        return;
+                    }
                     for ((x, &s), &w) in input.iter_mut().zip(frame).zip(&self.window) {
                         *x = s * w;
                     }

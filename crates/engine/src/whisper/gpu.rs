@@ -79,8 +79,14 @@ impl GpuWhisper {
                 gpu.info.name
             )));
         }
-        let encoder = encoder::Encoder::load(gpu, file, hp, options)?;
-        let decoder = decoder::Decoder::load(gpu, file, hp, options)?;
+        // Out of memory (the GPU's, or the host's for staging) fails the load rather than
+        // leaving invalid buffers behind.
+        let (encoder, decoder) = gpu.allocating("Whisper", || {
+            Ok((
+                encoder::Encoder::load(gpu, file, hp, options)?,
+                decoder::Decoder::load(gpu, file, hp, options)?,
+            ))
+        })?;
         // The loads' bind groups (over temporary buffers) aren't needed again.
         gpu.clear_bind_groups();
         Ok(GpuWhisper {

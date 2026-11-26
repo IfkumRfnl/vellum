@@ -138,8 +138,10 @@ struct Block {
 
 struct Kernels {
     embed: Arc<Kernel>,
-    /// By rows per subgroup (1, 2, 4), without and with the layer norm.
-    gemv: [[Arc<Kernel>; 2]; 3],
+    /// By the most windows a dispatch takes (1, 2, 4, 8: fewer accumulators and reductions
+    /// per lane for fewer windows, each output's arithmetic the same), rows per subgroup (1,
+    /// 2, 4), without and with the layer norm.
+    gemv: [[[Arc<Kernel>; 2]; 3]; 4],
     self_attend: Arc<Kernel>,
     cross_attend: Arc<Kernel>,
     cross_combine: Arc<Kernel>,
@@ -238,20 +240,24 @@ impl Decoder {
                 4,
             )?,
             gemv: {
-                let kernel = |rows: u32, norm: u32| {
+                let kernel = |windows: u32, rows: u32, norm: u32| {
                     gpu.kernel(
                         "whisper_gemv",
                         GEMV,
-                        &[("MAX_B", MAX_SLOTS as u32), ("ROWS", rows), ("NORM", norm)],
+                        &[("MAX_B", windows), ("ROWS", rows), ("NORM", norm)],
                         &[false, false, false, false, false, false, false, true],
                         20,
                     )
                 };
-                [
-                    [kernel(1, 0)?, kernel(1, 1)?],
-                    [kernel(2, 0)?, kernel(2, 1)?],
-                    [kernel(4, 0)?, kernel(4, 1)?],
-                ]
+                let by_rows = |windows: u32| -> Result<[[Arc<Kernel>; 2]; 3]> {
+                    Ok([
+                        [kernel(windows, 1, 0)?, kernel(windows, 1, 1)?],
+                        [kernel(windows, 2, 0)?, kernel(windows, 2, 1)?],
+                        [kernel(windows, 4, 0)?, kernel(windows, 4, 1)?],
+                    ])
+                };
+                const { assert!(MAX_SLOTS == 8) };
+                [by_rows(1)?, by_rows(2)?, by_rows(4)?, by_rows(8)?]
             },
             self_attend: gpu.kernel(
                 "whisper_self_attend",
@@ -378,6 +384,9 @@ impl Decoder {
             stacked: gpu.zeros_f32("cross keys and values", FRAMES * cross_kv.n),
         };
         let staging_bytes = (((1 + s * SLOT_WORDS) + s * MAX_CHOICES * 3 + s * vocab) * 4) as u64;
+        // Readback buffers for the runs in flight (two, and one being read), made now so a
+        // run never allocates.
+        let staging = (0..3).map(|_| new_staging(gpu, staging_bytes)).collect();
         Ok(Decoder {
             gpu: gpu.clone(),
             d,
@@ -394,7 +403,7 @@ impl Decoder {
             cross_kv,
             masks: gpu.upload_u32("token masks", &masks),
             buffers,
-            staging: Mutex::new(Vec::new()),
+            staging: Mutex::new(staging),
             staging_bytes,
         })
     }
@@ -583,14 +592,11 @@ impl Decoder {
     }
 
     fn take_staging(&self) -> wgpu::Buffer {
-        self.staging.lock().unwrap().pop().unwrap_or_else(|| {
-            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("decoder readback"),
-                size: self.staging_bytes,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        })
+        self.staging
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| new_staging(&self.gpu, self.staging_bytes))
     }
 
     fn record_readback(&self, rec: &mut Recorder, staging: &wgpu::Buffer, host: &[usize]) {
@@ -762,8 +768,9 @@ impl Decoder {
         let bias = w.bias.as_ref().unwrap_or(&w.scales);
         // A fused layer norm costs each workgroup its rows' statistics: fewer, larger ones.
         let rows = if norm.is_some() { 4 } else { gemv_rows(batch) };
-        let kernel =
-            &self.kernels.gemv[rows.trailing_zeros() as usize][usize::from(norm.is_some())];
+        let windows = batch.next_power_of_two().min(MAX_SLOTS);
+        let kernel = &self.kernels.gemv[windows.trailing_zeros() as usize]
+            [rows.trailing_zeros() as usize][usize::from(norm.is_some())];
         let (gamma, beta) = norm.map_or((&w.scales, &w.scales), |n| (&n.weight, &n.bias));
         rec.dispatch(
             label,
@@ -811,6 +818,16 @@ impl Decoder {
         drop(rec);
         profiler.read(&self.gpu)
     }
+}
+
+/// A buffer the decoder's state, choices and logits are copied into and read back from.
+fn new_staging(gpu: &Gpu, bytes: u64) -> wgpu::Buffer {
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("decoder readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 /// Output rows per subgroup of the matrix-vector kernel for a batch: one for a window or

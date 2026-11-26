@@ -15,7 +15,9 @@
 // The step's state (word 0: whether any window is still decoding) lets a step recorded ahead
 // of time cost nothing once every window is done.
 //
-// Prepended by the host: const MAX_B (8), ROWS (1, 2 or 4), NORM (0 or 1).
+// Prepended by the host: const MAX_B (1, 2, 4 or 8: the most windows the dispatch takes, so a
+// lane keeps only as many accumulators as it needs, each output's sum made the same way
+// whatever MAX_B is), ROWS (1, 2 or 4), NORM (0 or 1).
 
 struct Params {
     n: u32,

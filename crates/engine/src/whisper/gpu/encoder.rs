@@ -73,6 +73,10 @@ pub struct Encoder {
     buffers: Buffers,
 }
 
+/// Bytes the encoder's activations (a batch's residual stream, multiply outputs and the
+/// like) may take on the GPU.
+const ACTIVATION_BUDGET: usize = 192 << 20;
+
 impl Encoder {
     pub fn load(
         gpu: &Arc<Gpu>,
@@ -141,7 +145,17 @@ impl Encoder {
             })
             .collect::<Result<Vec<Block>>>()?;
         let d_ff = blocks.first().map_or(4 * d, |b| b.fc1.n);
-        let b = options.max_batch.max(1);
+        // A window costs the same GPU time in any batch, so the batch is only as large as its
+        // activations' budget allows: 4 windows for Small, 2 for Turbo (whose activations are
+        // 79 MB a window, memory the driver also charges to the system's commit).
+        let per_window = 4
+            * (MEL_FRAMES * mels
+                + 3 * FRAMES * d
+                + (FRAMES * 3 * d).max(MEL_FRAMES * d)
+                + (FRAMES * d_ff)
+                    .max(FRAMES * 3 * d)
+                    .max(MEL_FRAMES * conv1.k));
+        let b = options.max_batch.min(ACTIVATION_BUDGET / per_window).max(1);
         let rows = b * FRAMES;
         let hidden = (rows * d_ff)
             .max(rows * 3 * d)
