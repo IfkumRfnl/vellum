@@ -18,4 +18,4 @@ reads whole public videos as the app does and measures the results:
 
 Each test prints its results and appends them to `target/live-report.md`. Thresholds sit just under the measured values noted beside them.
 
-The live tests need yt-dlp, FFmpeg and Node.js or Deno, and download any speech models that aren't cached yet. Set `HF_HUB_OFFLINE=1` to use only cached models, or `TRANSCRIBE_BACKENDS=cpu` to test on the CPU.
+The live tests need yt-dlp, FFmpeg and Node.js or Deno, and download any speech models that aren't cached yet. Set `HF_HUB_OFFLINE=1` to use only cached models, or `VELLUM_DEVICE=cpu` to test on the CPU.

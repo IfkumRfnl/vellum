@@ -15,7 +15,7 @@
 
 Vellum is a native desktop app written in Rust with [Rune](https://github.com/anomalyco/rune). It reads a video's captions, or downloads its audio and transcribes it locally with Parakeet or Whisper, optionally labelling speakers.
 
-- **Local speech recognition.** Parakeet Unified English, Whisper Small and Whisper Large v3 Turbo through [transcribe.cpp](https://crates.io/crates/transcribe-cpp), on Vulkan, Metal or the CPU. No Python, nothing uploaded.
+- **Local speech recognition.** Parakeet Unified English, Whisper Small and Whisper Large v3 Turbo on Vellum's own speech engine, written in Rust, on the GPU or the CPU. No Python, nothing uploaded.
 - **Speaker labels.** Vellum can tell up to four voices apart and label each speaker's turns, on the GPU when there is one.
 - **One progress indicator.** A plate of dots fills as the transcript is made, with the percentage, the time left and the words as they're recognized.
 - **Reading progress.** A hairline along the top fills as you read, and the toolbar shows how far you are and the time left at your reading pace, which Vellum learns from how you scroll and remembers.
@@ -29,19 +29,19 @@ Vellum also needs [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases), with Node
 
 ### Build from source
 
-You need Rust 1.99.1 or newer, CMake and a C++ compiler: the Visual Studio C++ build tools on Windows, Xcode with the Metal toolchain on macOS. Windows x64 and Linux also need the Vulkan headers and shader tools for GPU speech recognition.
+You need Rust 1.99.1 or newer and a C compiler for a few dependencies (the Visual Studio build tools Rust uses on Windows, Xcode's command line tools on macOS). Linux also needs the xkbcommon, fontconfig and Wayland development packages.
 
 ```sh
 cargo run --release --locked
 ```
 
-Keep the native libraries with the executable when you move a build: the DLLs beside `vellum.exe` on Windows, the `.dylib`s beside `vellum` on macOS, or the `.so`s and the `vellum-libs/` directory beside `vellum` on Linux.
+A build is a single executable, `target/release/vellum`, with no libraries to keep beside it.
 
 | Desktop | Speech acceleration | Display |
 | --- | --- | --- |
-| Windows x64 | Vulkan or CPU | Direct3D 12 |
+| Windows x64 | A discrete GPU (Vulkan, else Direct3D 12) or the CPU | Direct3D 12 |
 | Windows ARM64 | CPU | Direct3D 12 |
-| Linux | Vulkan or CPU | A graphical session with a Vulkan driver, hardware or software |
+| Linux | A discrete GPU (Vulkan) or the CPU | A graphical session with a Vulkan driver, hardware or software |
 | macOS | Metal or CPU | A Metal-capable Mac |
 
 ## Using Vellum
@@ -59,7 +59,7 @@ In the reader, **Copy** copies the whole transcript, and **Aa** changes the type
 | Ctrl + mouse wheel | Text size |
 | Esc | Cancel a transcription, or close **Aa** |
 
-Speech recognition uses your GPU when it can and falls back to the CPU otherwise; set `TRANSCRIBE_BACKENDS=cpu` to always use the CPU. Downloaded audio is deleted once the transcript is ready. Models are kept in the Hugging Face cache, so other apps that use it can share them.
+Speech recognition uses your GPU when it can and falls back to the CPU otherwise; set `VELLUM_DEVICE=cpu` to always use the CPU. Downloaded audio is deleted once the transcript is ready. Models are kept in the Hugging Face cache, so other apps that use it can share them.
 
 ## Development
 
@@ -67,11 +67,11 @@ Speech recognition uses your GPU when it can and falls back to the CPU otherwise
 cargo test --locked
 ```
 
-See [tests/README.md](tests/README.md) for the optional tests that transcribe real videos.
+See [tests/README.md](tests/README.md) for the optional tests that transcribe real videos, and [crates/lab/README.md](crates/lab/README.md) for the engine lab, which measures Vellum's speech engine against transcribe.cpp.
 
 ## Credits
 
-Vellum stands on [Rune](https://github.com/anomalyco/rune) for its interface, [transcribe.cpp](https://crates.io/crates/transcribe-cpp) for speech and speaker recognition, NVIDIA's [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (CC-BY-4.0) and OpenAI's [Whisper](https://github.com/openai/whisper) (MIT) models, NVIDIA's [Streaming Sortformer](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1) speaker model (NVIDIA Open Model License), [yt-dlp](https://github.com/yt-dlp/yt-dlp), [FFmpeg](https://ffmpeg.org) and the [Inter](https://rsms.me/inter/) typeface.
+Vellum stands on [Rune](https://github.com/anomalyco/rune) for its interface, [transcribe.cpp](https://crates.io/crates/transcribe-cpp), from which its speech engine is ported, NVIDIA's [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (CC-BY-4.0) and OpenAI's [Whisper](https://github.com/openai/whisper) (MIT) models, NVIDIA's [Streaming Sortformer](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1) speaker model (NVIDIA Open Model License), [yt-dlp](https://github.com/yt-dlp/yt-dlp), [FFmpeg](https://ffmpeg.org) and the [Inter](https://rsms.me/inter/) typeface.
 
 ## License
 

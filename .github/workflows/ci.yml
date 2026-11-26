@@ -23,49 +23,17 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
 
-      # Compiled dependencies and the built speech engine, shared
-      # with the Linux x64 release build (see release.yml).
+      # Compiled dependencies, saved from main.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Find the native libraries' versions
-        run: |
-          version() { grep -A1 "^name = \"$1\"$" Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p'; }
-          echo "ENGINE_KEY=transcribe-linux-x64-$(version transcribe-cpp-sys)-v1" >> "$GITHUB_ENV"
-      - name: Restore the speech engine
-        id: engine
-        uses: actions/cache/restore@v4
-        with:
-          path: .native/transcribe
-          key: ${{ env.ENGINE_KEY }}
-      - name: Use the restored speech engine
-        if: steps.engine.outputs.cache-hit == 'true'
-        run: echo "TRANSCRIBE_DIR=${{ github.workspace }}/.native/transcribe" >> "$GITHUB_ENV"
 
-      # What Vellum's Linux dependencies link: xkbcommon, fontconfig and Wayland (X11 loads at
-      # run time). The Vulkan loader and shader compiler only build the speech engine.
+      # What Vellum's Linux dependencies link: xkbcommon, fontconfig and Wayland (X11 and
+      # Vulkan load at run time).
       - name: Install Linux libraries
         run: |
-          packages="libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev"
-          if [ "${{ steps.engine.outputs.cache-hit }}" != true ]; then packages="$packages libvulkan-dev glslc libshaderc-dev"; fi
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends $packages
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
-      - name: Keep the speech engine
-        if: steps.engine.outputs.cache-hit != 'true'
-        run: |
-          manifest="$(find target -path '*transcribe-cpp-sys*' -name transcribe-link.json | head -1)"
-          prefix="$(dirname "$(dirname "$manifest")")"
-          mkdir -p .native/transcribe
-          for part in bin include lib lib64 share; do
-            if [ -e "$prefix/$part" ]; then cp -a "$prefix/$part" .native/transcribe/; fi
-          done
-          rm -rf "$prefix/build"
-      - name: Save the speech engine
-        if: steps.engine.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .native/transcribe
-          key: ${{ env.ENGINE_KEY }}

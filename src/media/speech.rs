@@ -4,63 +4,22 @@ use crate::{
     pipeline::{Stage, Update},
 };
 use anyhow::{Context, Result, ensure};
-use std::{collections::HashMap, ops::Range, path::Path, sync::OnceLock};
-use transcribe_cpp::{
-    Backend, DiarizeExtension, DiarizeOptions, Error, Model, ModelOptions, RunOptions, Session,
-    SortformerDiarizeOptions, SortformerPreset, SpeakerSegment, TimestampKind,
-};
+use std::{collections::HashMap, ops::Range, path::Path};
 use vellum_engine::{
-    Device, Diarizer, Error as EngineError, NoTrace, Options as EngineOptions,
-    RunOptions as EngineRunOptions, Transcriber,
+    Device, Diarizer, Error as EngineError, NoTrace, Options as EngineOptions, RunOptions,
+    SpeakerTurn, Transcriber,
 };
 
 const RATE: usize = 16000;
 
-fn open_session(path: &Path, backend: Backend) -> transcribe_cpp::Result<Session> {
-    Model::load_with(
-        path,
-        &ModelOptions {
-            backend,
-            ..Default::default()
-        },
-    )?
-    .session()
-}
-
-fn device_error(error: &Error) -> bool {
-    matches!(error, Error::Backend(_) | Error::OutOfMemory(_))
-}
-
-fn cpu_session(path: &Path, error: Error, progress: &Progress) -> Result<Session> {
-    progress.note("Switching to the CPU…")?;
-    progress.update(Update::Device("CPU".into()))?;
-    open_session(path, Backend::Cpu).with_context(|| format!("CPU fallback failed after {error}"))
-}
-
-/// Registers the GPUs and CPU the speech models run on, once.
-fn speech_devices() -> Result<()> {
-    // Registration mutates the native process-wide device registry. Finish it
-    // before any job opens a model, including when a cancelled job is unwinding.
-    static BACKENDS: OnceLock<Result<(), String>> = OnceLock::new();
-    BACKENDS
-        .get_or_init(|| transcribe_cpp::init_backends_default().map_err(|e| e.to_string()))
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("Could not initialize speech devices: {e}"))?;
-    Ok(())
-}
-
-/// Whether Vellum's own engine (`crates/engine`) runs what it can: Parakeet, which it
-/// transcribes as transcribe.cpp does about three times as fast, and the speaker labels
-/// (Sortformer, the same turns about three times as fast). `VELLUM_ENGINE=cpp` switches both
-/// back to transcribe.cpp, to compare the two.
-fn own_engine() -> bool {
-    !std::env::var("VELLUM_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("cpp"))
-}
-
-/// Whether a speech model runs on Vellum's engine. The Whisper models stay on transcribe.cpp
-/// until their port lands.
-fn own_speech_engine(model: &models::SpeechModel) -> bool {
-    model.id == "parakeet_unified_en" && own_engine()
+/// The device the app asks the engine for: the best GPU, or else the CPU, unless
+/// `VELLUM_DEVICE=cpu` asks for the CPU alone.
+fn requested_device() -> Device {
+    if std::env::var("VELLUM_DEVICE").is_ok_and(|v| v.eq_ignore_ascii_case("cpu")) {
+        Device::Cpu
+    } else {
+        Device::Auto
+    }
 }
 
 /// How Vellum's engine loads a model on `device`: with the GPU's compiled kernels kept in
@@ -73,6 +32,22 @@ fn engine_options(device: Device) -> EngineOptions {
         cache_dir: directories::ProjectDirs::from("", "", "Vellum")
             .map(|dirs| dirs.cache_dir().join("gpu")),
     }
+}
+
+/// The whole recording as samples from -1 to 1, in a buffer of exactly its length: a
+/// 2½-hour recording takes 560 MB, where a growing one would ask for 1 GB on top of the
+/// 512 MB it outgrew.
+fn read_audio(wav: &Path) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(wav)?;
+    ensure!(
+        reader.spec().sample_rate as usize == RATE,
+        "Unsupported audio sample rate"
+    );
+    let mut pcm = Vec::with_capacity(reader.duration() as usize);
+    for sample in reader.samples::<i16>() {
+        pcm.push(sample? as f32 / 32768.);
+    }
+    Ok(pcm)
 }
 
 // Look for the quietest 40 ms near the end of a full window.
@@ -155,6 +130,15 @@ fn add_window(
     Ok(())
 }
 
+/// A recording's cues, the model's name and the language it was transcribed in, on Vellum's
+/// engine: the whole recording, cut into windows (exactly-silent ones skipped), handed to the
+/// engine at once so it works on several windows together. Each window's words reach the
+/// progress screen as soon as it and those before it are done. A GPU that fails mid-way leaves
+/// the windows still to do to the CPU.
+///
+/// Parakeet Unified is English only. Whisper detects the language until a window has words,
+/// then keeps it for the rest of the recording (the engine applies that rule itself; the app
+/// follows it to name the language and to carry it over to the CPU).
 pub fn transcribe(
     wav: &Path,
     cache: &Path,
@@ -164,93 +148,76 @@ pub fn transcribe(
     progress.stage(Stage::Model)?;
     let path = model.artifact.get(cache, progress)?;
     progress.update(Update::Estimated)?;
-    if own_speech_engine(model) {
-        return transcribe_with_engine(wav, &path, model, progress);
-    }
-    speech_devices()?;
-    let mut session = match open_session(&path, Backend::Auto) {
-        Err(error) if device_error(&error) => cpu_session(&path, error, progress)?,
-        result => result?,
-    };
-    let device = session.model().device()?;
-    let mut on_cpu = device.kind == "cpu";
-    progress.update(Update::Device(if on_cpu {
-        "CPU".to_owned()
-    } else {
-        let mut kind = device.kind.clone();
-        if let Some(first) = kind.get_mut(..1) {
-            first.make_ascii_uppercase();
-        }
-        format!("{kind} · {}", device.description)
-    }))?;
-    session.set_cancel_token(progress.token());
-    let window = window_samples(session.limits()?.effective_max_audio_ms);
-    let mut options = RunOptions {
-        language: (model.id == "parakeet_unified_en").then(|| "en".into()),
-        ..Default::default()
-    };
-    let mut reader = hound::WavReader::open(wav)?;
-    let total = reader.duration() as usize;
-    let mut samples = reader.samples::<i16>();
-    let mut pcm = Vec::with_capacity(window);
-    let mut offset = 0;
+    let mut transcriber = load_engine(&path, progress)?;
+    let window = window_samples(transcriber.max_audio_ms().into());
+    let pcm = read_audio(wav)?;
+    let total = pcm.len().max(1);
+    let speaking: Vec<Range<usize>> = windows(&pcm, window)
+        .into_iter()
+        .filter(|r| pcm[r.clone()].iter().any(|s| *s != 0.))
+        .collect();
+    let mut language: Option<String> = (model.id == "parakeet_unified_en").then(|| "en".into());
+    let token = progress.token();
+    let stop = || token.is_cancelled();
     let mut cues = Vec::new();
+    // Windows of `speaking` whose words are in `cues`.
+    let mut done = 0;
     progress.stage(Stage::Transcribe)?;
-    while offset < total {
-        for sample in samples.by_ref().take(window - pcm.len()) {
-            pcm.push(sample? as f32 / 32768.);
-        }
-        ensure!(!pcm.is_empty(), "The audio ended unexpectedly");
-        let count = if offset + pcm.len() < total {
-            boundary(&pcm)
-        } else {
-            pcm.len()
+    while done < speaking.len() {
+        let rest: Vec<&[f32]> = speaking[done..].iter().map(|r| &pcm[r.clone()]).collect();
+        let options = RunOptions {
+            language: language.clone(),
         };
-        progress.fraction(offset as f32 / total as f32)?;
-        if pcm[..count].iter().any(|s| *s != 0.) {
-            let result = match session.run(&pcm[..count], &options) {
-                Err(error) if !on_cpu && device_error(&error) => {
-                    drop(session);
-                    session = cpu_session(&path, error, progress)?;
-                    session.set_cancel_token(progress.token());
-                    on_cpu = true;
-                    session.run(&pcm[..count], &options)?
-                }
-                result => result?,
-            };
-            if options.language.is_none() && !result.text.trim().is_empty() {
-                options.language = result.language;
+        // An error of the app's own (a cancelled job) stops the engine, and is what's reported.
+        let mut failed = None;
+        let ran = transcriber.run_each(&rest, &options, &mut NoTrace, &stop, &mut |_, result| {
+            let range = &speaking[done];
+            if language.is_none() && !result.text.trim().is_empty() {
+                language = result.language.clone();
             }
-            let pieces: Vec<(i64, i64, String)> = if matches!(
-                result.timestamp_kind,
-                TimestampKind::Word | TimestampKind::Token
-            ) && !result.words.is_empty()
-            {
-                let words = result.words.into_iter();
-                words.map(|w| (w.t0_ms, w.t1_ms, w.text)).collect()
-            } else {
-                let segments = result.segments.into_iter();
-                segments.map(|s| (s.t0_ms, s.t1_ms, s.text)).collect()
-            };
-            add_window(&mut cues, offset, count, pieces, result.text, progress)?;
+            let words = result.words.into_iter().map(|w| (w.t0_ms, w.t1_ms, w.text));
+            let added = add_window(
+                &mut cues,
+                range.start,
+                range.len(),
+                words,
+                result.text,
+                progress,
+            )
+            .and_then(|()| progress.fraction(range.end as f32 / total as f32));
+            done += 1;
+            added.map_err(|error| {
+                failed = Some(error);
+                EngineError::Cancelled
+            })
+        });
+        match (ran, failed) {
+            (Ok(()), _) => {}
+            (Err(_), Some(error)) => return Err(error),
+            (Err(EngineError::Cancelled), None) => {
+                progress.check()?;
+                anyhow::bail!("Cancelled");
+            }
+            (Err(error), None) if transcriber.gpu().is_some() => {
+                progress.note("Switching to the CPU…")?;
+                progress.update(Update::Device("CPU".into()))?;
+                drop(transcriber);
+                transcriber = Transcriber::load(&path, &engine_options(Device::Cpu))
+                    .with_context(|| format!("CPU fallback failed after {error}"))?;
+            }
+            (Err(error), None) => return Err(error).context("Speech recognition failed"),
         }
-        offset += count;
-        progress.fraction(offset as f32 / total as f32)?;
-        pcm.drain(..count);
     }
-    Ok((
-        cues,
-        model.name.into(),
-        options.language.unwrap_or_default(),
-    ))
+    progress.fraction(1.)?;
+    Ok((cues, model.name.into(), language.unwrap_or_default()))
 }
 
-/// Loads Parakeet on Vellum's engine: on the GPU when there's a good one, else (or when the GPU
-/// can't take the model) on the CPU. Names the device on the progress screen as the
-/// transcribe.cpp path does ("Vulkan · NVIDIA GeForce RTX 4060 Laptop GPU", "CPU").
+/// Loads a speech model on Vellum's engine: on the GPU when there's a good one, else (or when
+/// the GPU can't take the model) on the CPU. Names the device on the progress screen
+/// ("Vulkan · NVIDIA GeForce RTX 4060 Laptop GPU", "CPU").
 fn load_engine(path: &Path, progress: &Progress) -> Result<Transcriber> {
     let load = |device| Transcriber::load(path, &engine_options(device));
-    let transcriber = match load(Device::Auto) {
+    let transcriber = match load(requested_device()) {
         // A file the engine can't read fails the same way on the CPU.
         Err(error @ (EngineError::Io(_) | EngineError::Gguf(_) | EngineError::Unsupported(_))) => {
             return Err(error).context("Could not load the speech model");
@@ -282,87 +249,6 @@ fn engine_device(gpu: Option<&vellum_engine::gpu::Gpu>) -> String {
     format!("{api} · {}", gpu.info.name)
 }
 
-/// Parakeet on Vellum's engine: the whole recording, cut into the same windows as the
-/// transcribe.cpp path (exactly-silent ones skipped), handed to the engine at once so it works
-/// on several windows together. Each window's words reach the progress screen as soon as it
-/// and those before it are done. A GPU that fails mid-way leaves the windows still to do to
-/// the CPU.
-fn transcribe_with_engine(
-    wav: &Path,
-    path: &Path,
-    model: &models::SpeechModel,
-    progress: &Progress,
-) -> Result<(Vec<Cue>, String, String)> {
-    let mut transcriber = load_engine(path, progress)?;
-    let window = window_samples(transcriber.max_audio_ms().into());
-    let mut reader = hound::WavReader::open(wav)?;
-    ensure!(
-        reader.spec().sample_rate as usize == RATE,
-        "Unsupported speech sample rate"
-    );
-    let pcm = reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / 32768.))
-        .collect::<Result<Vec<_>, _>>()?;
-    let total = pcm.len().max(1);
-    let speaking: Vec<Range<usize>> = windows(&pcm, window)
-        .into_iter()
-        .filter(|r| pcm[r.clone()].iter().any(|s| *s != 0.))
-        .collect();
-    // Parakeet Unified is English only: there's nothing to detect.
-    let language = "en";
-    let options = EngineRunOptions {
-        language: Some(language.into()),
-    };
-    let token = progress.token();
-    let stop = || token.is_cancelled();
-    let mut cues = Vec::new();
-    // Windows of `speaking` whose words are in `cues`.
-    let mut done = 0;
-    progress.stage(Stage::Transcribe)?;
-    while done < speaking.len() {
-        let rest: Vec<&[f32]> = speaking[done..].iter().map(|r| &pcm[r.clone()]).collect();
-        // An error of the app's own (a cancelled job) stops the engine, and is what's reported.
-        let mut failed = None;
-        let ran = transcriber.run_each(&rest, &options, &mut NoTrace, &stop, &mut |_, result| {
-            let range = &speaking[done];
-            let words = result.words.into_iter().map(|w| (w.t0_ms, w.t1_ms, w.text));
-            let added = add_window(
-                &mut cues,
-                range.start,
-                range.len(),
-                words,
-                result.text,
-                progress,
-            )
-            .and_then(|()| progress.fraction(range.end as f32 / total as f32));
-            done += 1;
-            added.map_err(|error| {
-                failed = Some(error);
-                EngineError::Cancelled
-            })
-        });
-        match (ran, failed) {
-            (Ok(()), _) => {}
-            (Err(_), Some(error)) => return Err(error),
-            (Err(EngineError::Cancelled), None) => {
-                progress.check()?;
-                anyhow::bail!("Cancelled");
-            }
-            (Err(error), None) if transcriber.gpu().is_some() => {
-                progress.note("Switching to the CPU…")?;
-                progress.update(Update::Device("CPU".into()))?;
-                drop(transcriber);
-                transcriber = Transcriber::load(path, &engine_options(Device::Cpu))
-                    .with_context(|| format!("CPU fallback failed after {error}"))?;
-            }
-            (Err(error), None) => return Err(error).context("Speech recognition failed"),
-        }
-    }
-    progress.fraction(1.)?;
-    Ok((cues, model.name.into(), language.into()))
-}
-
 pub fn label_speakers(
     wav: &Path,
     cache: &Path,
@@ -372,73 +258,20 @@ pub fn label_speakers(
     progress.stage(Stage::Speakers)?;
     let path = models::SPEAKERS.get(cache, progress)?;
     progress.update(Update::Estimated)?;
-    let mut audio = hound::WavReader::open(wav)?;
-    ensure!(
-        audio.spec().sample_rate as usize == RATE,
-        "Unsupported speaker analysis sample rate"
-    );
-    let samples = audio
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / 32768.))
-        .collect::<Result<Vec<_>, _>>()?;
-    let segments = if own_engine() {
-        diarize_with_engine(&path, &samples, progress)?
-    } else {
-        diarize_with_cpp(&path, &samples, progress)?
-    };
+    let samples = read_audio(wav)?;
+    let segments = diarize(&path, &samples, progress)?;
     assign_speakers(cues, &turns(segments));
     Ok(())
 }
 
-/// Speaker segments from transcribe.cpp's Sortformer, on the GPU when it can, else the CPU.
-fn diarize_with_cpp(
-    path: &Path,
-    samples: &[f32],
-    progress: &Progress,
-) -> Result<Vec<SpeakerSegment>> {
-    speech_devices()?;
-    let diarize = |backend| -> transcribe_cpp::Result<Vec<SpeakerSegment>> {
-        let model = Model::load_with(
-            path,
-            &ModelOptions {
-                backend,
-                ..Default::default()
-            },
-        )?;
-        let mut session = model.diarize_session()?;
-        session.set_cancel_token(progress.token());
-        // The offline operating point: half-minute windows, the most accurate and, on a GPU,
-        // ten times faster than the default real-time one (two hours in 21 s against 207 s).
-        let preset = Some(SortformerPreset::VeryHighLatency);
-        session.run(
-            samples,
-            &DiarizeOptions {
-                family: Some(DiarizeExtension::Sortformer(SortformerDiarizeOptions {
-                    preset,
-                })),
-            },
-        )
-    };
-    Ok(match diarize(Backend::Auto) {
-        Err(error) if device_error(&error) => {
-            progress.note("Switching to the CPU…")?;
-            diarize(Backend::Cpu).with_context(|| format!("CPU fallback failed after {error}"))?
-        }
-        result => result.context("Speaker analysis failed")?,
-    })
-}
-
-/// Speaker segments from Sortformer on Vellum's engine, which streams the recording in
-/// half-minute chunks as transcribe.cpp's offline preset does: on the GPU when there's a good
-/// one, else (or when the GPU fails, at load or mid-way) on the CPU. The device goes to the
-/// progress screen; a cancelled job stops it between chunks.
-fn diarize_with_engine(
-    path: &Path,
-    samples: &[f32],
-    progress: &Progress,
-) -> Result<Vec<SpeakerSegment>> {
+/// Who spoke when, from Streaming Sortformer on Vellum's engine, which streams the recording in
+/// half-minute chunks (the offline operating point: the most accurate, and on a GPU ten times
+/// faster than the real-time one): on the GPU when there's a good one, else (or when the GPU
+/// fails, at load or mid-way) on the CPU. The device goes to the progress screen; a cancelled
+/// job stops it between chunks.
+fn diarize(path: &Path, samples: &[f32], progress: &Progress) -> Result<Vec<SpeakerTurn>> {
     let load = |device| Diarizer::load(path, &engine_options(device));
-    let mut diarizer = match load(Device::Auto) {
+    let mut diarizer = match load(requested_device()) {
         // A file the engine can't read fails the same way on the CPU.
         Err(error @ (EngineError::Io(_) | EngineError::Gguf(_) | EngineError::Unsupported(_))) => {
             return Err(error).context("Could not load the speaker model");
@@ -465,22 +298,13 @@ fn diarize_with_engine(
             load(Device::Cpu).with_context(|| format!("CPU fallback failed after {error}"))?;
         ran = cpu.run_until(samples, &mut NoTrace, &stop);
     }
-    let speaker_turns = match ran {
+    match ran {
         Err(EngineError::Cancelled) => {
             progress.check()?;
             anyhow::bail!("Cancelled");
         }
-        result => result.context("Speaker analysis failed")?,
-    };
-    Ok(speaker_turns
-        .into_iter()
-        .map(|t| SpeakerSegment {
-            t0_ms: t.t0_ms,
-            t1_ms: t.t1_ms,
-            speaker_id: t.speaker,
-            p: t.p,
-        })
-        .collect())
+        result => result.context("Speaker analysis failed"),
+    }
 }
 
 /// The least a voice is heard in the whole video to count as a speaker. The model also
@@ -495,14 +319,14 @@ struct Turn {
 
 /// The model's speaker segments as turns sorted by start time, without voices heard too
 /// briefly to be a speaker.
-fn turns(segments: Vec<SpeakerSegment>) -> Vec<Turn> {
+fn turns(segments: Vec<SpeakerTurn>) -> Vec<Turn> {
     let mut talk: HashMap<i32, f64> = HashMap::new();
     let mut turns: Vec<Turn> = segments
         .into_iter()
         .map(|s| Turn {
             start: s.t0_ms as f64 / 1000.,
             end: s.t1_ms as f64 / 1000.,
-            speaker: s.speaker_id,
+            speaker: s.speaker,
         })
         .inspect(|t| *talk.entry(t.speaker).or_default() += t.end - t.start)
         .collect();

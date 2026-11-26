@@ -29,21 +29,12 @@ url = "2"
 ureq = { version = "2.12", features = ["json"] }
 hound = "3.5"
 sha2 = "0.10"
-# Vellum's own speech engine (crates/engine): Parakeet, on its own wgpu device.
+# Vellum's own speech engine (crates/engine): speech and speakers, on its own wgpu device,
+# in Rust (no C++ to build, no libraries to ship beside the executable).
 vellum-engine = { path = "crates/engine" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["metal"] }
-
-[target.'cfg(all(not(target_os = "macos"), not(all(windows, target_arch = "aarch64"))))'.dependencies]
-transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["vulkan", "dynamic-backends"] }
-
-# Windows on ARM transcribes on the CPU: there's no Vulkan SDK for it to build against.
-[target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
-transcribe-cpp = { version = "=0.4.2", default-features = false }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

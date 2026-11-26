@@ -72,7 +72,12 @@ pub fn ensure() -> Result<Reference> {
     };
     if stale {
         build()?;
-        std::fs::write(&stamp_file, "")?;
+        // Not empty: Windows leaves an empty file's date alone when it's written empty again.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        std::fs::write(
+            &stamp_file,
+            format!("{}\n", now.unwrap_or_default().as_secs()),
+        )?;
     }
     let cache = exe.with_extension("lab.json");
     let stamp = std::fs::metadata(&exe)

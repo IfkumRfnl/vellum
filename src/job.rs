@@ -12,12 +12,27 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
 };
-use transcribe_cpp::CancelToken;
+
+/// Set once a job is cancelled. The worker checks it between steps, and the speech engine
+/// polls it from its own threads between windows, encoder blocks and speaker chunks.
+#[derive(Default)]
+pub struct CancelToken(AtomicBool);
+
+impl CancelToken {
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 pub enum Event {
     /// Model preparation finished: the speech models now on disk.
@@ -62,7 +77,20 @@ impl Job {
             sent: Cell::new((-1.0, None)),
         };
         thread::spawn(move || {
-            let result = run(&progress).unwrap_or_else(|e| Event::Error(format!("{e:#}")));
+            // A panic in the work (the speech engine's GPU code runs on this thread) ends the
+            // job with its message, rather than leaving the progress screen waiting forever.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&progress)));
+            let result = match ran {
+                Ok(result) => result.unwrap_or_else(|e| Event::Error(format!("{e:#}"))),
+                Err(panic) => Event::Error(
+                    panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("The job stopped unexpectedly")
+                        .to_owned(),
+                ),
+            };
             if !progress.token().is_cancelled() && progress.send.send(result).is_ok() {
                 (progress.wake)();
             }
