@@ -39,22 +39,29 @@ pub trait Engine {
         anyhow::bail!("this model doesn't transcribe")
     }
 
-    /// Every window of a recording at once, in a language known in advance. An engine can
-    /// batch or pipeline them (encode the next while decoding this one); by default they run
-    /// one by one.
-    fn transcribe_all(&mut self, windows: &[&[f32]], language: &str) -> Result<Vec<WindowResult>> {
-        windows
-            .iter()
-            .enumerate()
-            .map(|(i, pcm)| {
-                let start = Instant::now();
-                let mut result = self
-                    .transcribe(pcm, Some(language))
-                    .with_context(|| format!("window {i}"))?;
-                result.wall_ms = ms(start);
-                Ok(result)
-            })
-            .collect()
+    /// Every window of a recording at once. An engine can batch or pipeline them (encode the
+    /// next while decoding this one). Without a `language`, the app's rule holds: each window
+    /// is detected until one has words, and that window's language is used for the rest. By
+    /// default the windows run one by one.
+    fn transcribe_all(
+        &mut self,
+        windows: &[&[f32]],
+        language: Option<&str>,
+    ) -> Result<Vec<WindowResult>> {
+        let mut language = language.map(str::to_owned);
+        let mut out = Vec::with_capacity(windows.len());
+        for (i, pcm) in windows.iter().enumerate() {
+            let start = Instant::now();
+            let mut result = self
+                .transcribe(pcm, language.as_deref())
+                .with_context(|| format!("window {i}"))?;
+            result.wall_ms = ms(start);
+            if language.is_none() && !result.text.trim().is_empty() {
+                language = result.language.clone();
+            }
+            out.push(result);
+        }
+        Ok(out)
     }
 
     fn diarize(&mut self, _pcm: &[f32]) -> Result<Vec<Turn>> {
@@ -220,38 +227,22 @@ fn run_once(task: &Task, engine: &mut dyn Engine, pcm: &[f32]) -> Result<(Output
                 .collect();
             let speaking: Vec<usize> = (0..ranges.len()).filter(|i| !infos[*i].silent).collect();
             let mut results: Vec<Option<WindowResult>> = vec![None; ranges.len()];
-            match language.clone() {
-                // The language is fixed: hand the engine every window at once.
-                Some(fixed) => {
-                    let batch: Vec<&[f32]> =
-                        speaking.iter().map(|i| &pcm[ranges[*i].clone()]).collect();
-                    let got = engine.transcribe_all(&batch, &fixed)?;
-                    anyhow::ensure!(
-                        got.len() == batch.len(),
-                        "{} results for {} windows",
-                        got.len(),
-                        batch.len()
-                    );
-                    for (i, result) in speaking.iter().zip(got) {
-                        results[*i] = Some(result);
-                    }
+            // Every window at once; the engine applies the language rule (see
+            // `Engine::transcribe_all`), and the reports say which language each window ran in.
+            let batch: Vec<&[f32]> = speaking.iter().map(|i| &pcm[ranges[*i].clone()]).collect();
+            let got = engine.transcribe_all(&batch, language.as_deref())?;
+            anyhow::ensure!(
+                got.len() == batch.len(),
+                "{} results for {} windows",
+                got.len(),
+                batch.len()
+            );
+            for (i, result) in speaking.iter().copied().zip(got) {
+                infos[i].language = language.clone();
+                if language.is_none() && !result.text.trim().is_empty() {
+                    language = result.language.clone();
                 }
-                // As the app does: detect, and keep the first language heard in a window with
-                // words, so each window depends on the ones before it.
-                None => {
-                    for i in speaking.iter().copied() {
-                        let begun = Instant::now();
-                        let mut result = engine
-                            .transcribe(&pcm[ranges[i].clone()], language.as_deref())
-                            .with_context(|| format!("window {i} ({:?})", ranges[i]))?;
-                        result.wall_ms = ms(begun);
-                        infos[i].language = language.clone();
-                        if language.is_none() && !result.text.trim().is_empty() {
-                            language = result.language.clone();
-                        }
-                        results[i] = Some(result);
-                    }
-                }
+                results[i] = Some(result);
             }
             for (index, (range, (mut info, result))) in ranges
                 .iter()

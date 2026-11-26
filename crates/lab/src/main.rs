@@ -18,6 +18,7 @@ mod report;
 mod run;
 mod score;
 mod system;
+mod whisper;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -161,6 +162,34 @@ enum Command {
         /// Backends to consider: vulkan, dx12, metal.
         #[arg(long)]
         backend: Option<String>,
+    },
+    /// Whisper's GPU path against the CPU oracle: checkpoints, decisions, timing by batch.
+    Whisper {
+        /// small or turbo.
+        #[arg(long, default_value = "small")]
+        model: String,
+        /// Clips to compare on (default: the model's probe clips).
+        #[arg(long = "clip", value_delimiter = ',')]
+        clips: Vec<String>,
+        /// Windows encoded together for the batch check.
+        #[arg(long, default_value_t = 4)]
+        batch: usize,
+        /// Timed calls per batch size.
+        #[arg(long, default_value_t = 5)]
+        runs: u32,
+        /// The adapter: an index or part of its name (default: `VELLUM_GPU`, else the best).
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Backends to consider: vulkan, dx12, metal.
+        #[arg(long)]
+        backend: Option<String>,
+        /// Run the clips whole through the CPU oracle and the GPU, windows as the harness
+        /// cuts them, and say why each differing window differs.
+        #[arg(long)]
+        explain: bool,
+        /// A long clip for the pipeline check (empty: none).
+        #[arg(long, default_value = "youtube/ted-30-days")]
+        pipeline: String,
     },
     /// Downloads and prepares the recordings a tier needs.
     Fetch {
@@ -321,6 +350,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 runs,
                 adapter,
                 backend,
+            })?));
+        }
+        Command::Whisper {
+            model,
+            clips,
+            batch,
+            runs,
+            adapter,
+            backend,
+            explain,
+            pipeline,
+        } => {
+            return Ok(code(whisper::whisper(&whisper::Args {
+                model,
+                clips,
+                batch,
+                runs,
+                adapter,
+                backend,
+                explain,
+                pipeline,
             })?));
         }
         Command::Goldens {

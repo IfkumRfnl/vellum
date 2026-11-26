@@ -57,13 +57,22 @@ fn sources_modified() -> Option<std::time::SystemTime> {
 /// description and hash are kept beside it, so the loop doesn't start Vulkan just to name it.
 pub fn ensure() -> Result<Reference> {
     let exe = exe();
-    let built = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
+    // When cargo finds nothing to rebuild it leaves the executable's date alone, so the last
+    // build is marked by a stamp of its own (else every run would "rebuild" after any edit to
+    // the lockfile).
+    let stamp_file = exe.with_extension("built");
+    let built = [&stamp_file, &exe]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max()
+        .filter(|_| exe.is_file());
     let stale = match (built, sources_modified()) {
         (Some(built), Some(sources)) => sources > built,
         _ => true,
     };
     if stale {
         build()?;
+        std::fs::write(&stamp_file, "")?;
     }
     let cache = exe.with_extension("lab.json");
     let stamp = std::fs::metadata(&exe)

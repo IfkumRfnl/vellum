@@ -82,6 +82,8 @@ struct Totals {
     ref_der_seconds: f64,
     cand_der_seconds: f64,
     invented: (usize, usize),
+    /// Clips without speech where any words were heard, by each engine.
+    invented_clips: (usize, usize),
     /// Words aligned with a speaker-named script, and those labelled right by each engine.
     speaker_words: usize,
     ref_speaker_correct: usize,
@@ -136,6 +138,8 @@ impl Totals {
         if let Some((r, c)) = s.invented {
             self.invented.0 += r;
             self.invented.1 += c;
+            self.invented_clips.0 += usize::from(r > 0);
+            self.invented_clips.1 += usize::from(c > 0);
         }
         if let Some((r, c)) = &s.speakers {
             // Both label the same transcript, so they align the same words.
@@ -536,10 +540,13 @@ fn gates(t: &Totals, pending: bool, strict: bool) -> (String, bool) {
     {
         failed.push(format!("speakers {:.2}% < {:.2}%", 100. * c, 100. * r));
     }
-    if t.invented.1 > t.invented.0 {
+    // Counted in clips, not words: in a clip of noise both engines may fall back to sampling at
+    // temperature 1, which the reference seeds from the OS, so how many words it invents there
+    // is luck. Whether it invents any is the model's behaviour.
+    if t.invented_clips.1 > t.invented_clips.0 {
         failed.push(format!(
-            "{} words from no speech (reference {})",
-            t.invented.1, t.invented.0
+            "words from no speech in {} clips (reference {}; {} words against {})",
+            t.invented_clips.1, t.invented_clips.0, t.invented.1, t.invented.0
         ));
     }
     if failed.is_empty() {

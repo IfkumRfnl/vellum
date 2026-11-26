@@ -526,6 +526,7 @@ fn apply(y: &Mat, epilogue: Epilogue) -> Mat {
         Activation::None => out.map(|v| v * scale),
         Activation::Relu => out.map(|v| relu(v) * scale),
         Activation::Silu => out.map(|v| silu(v) * scale),
+        Activation::Gelu => out.map(|v| vellum_engine::cpu::gelu(v) * scale),
     }
     out
 }

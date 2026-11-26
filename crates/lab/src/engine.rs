@@ -75,9 +75,13 @@ impl Engine for Speech {
     }
 
     /// The whole recording to the engine at once, which pipelines it.
-    fn transcribe_all(&mut self, windows: &[&[f32]], language: &str) -> Result<Vec<WindowResult>> {
+    fn transcribe_all(
+        &mut self,
+        windows: &[&[f32]],
+        language: Option<&str>,
+    ) -> Result<Vec<WindowResult>> {
         let options = RunOptions {
-            language: Some(language.to_owned()),
+            language: language.map(str::to_owned),
         };
         Ok(self
             .model

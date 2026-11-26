@@ -110,3 +110,68 @@ Everywhere: ragged batching, the fusions, f16 storage with f32 math, the CPU dec
 on Vulkan get the 16×16 tensor-core multiply; Apple gets Metal's 8×8 simdgroup matrices; DX12 and
 Intel the SIMT or int8 kernels. The device is chosen by a short benchmark, not by vendor: this
 laptop's own Intel iGPU is slower than its CPU.
+
+## Whisper (Small, Large v3 Turbo)
+
+`whisper/gpu.rs` and `whisper/gpu/`, against the CPU oracle by `cargo lab whisper` (checkpoints,
+decisions with their margins, batch independence, timing by batch size; `--explain` runs whole
+clips through both and classifies each window that differs). Same rules as Parakeet's: f16
+weights for the tensor cores, everything else f32; a window's result never depends on its batch.
+
+- **Encoder**, a batch of 30 s windows at once: the two convolutions as multiplies over their
+  receptive fields (`im2col.wgsl`, weights reordered tap-major at load), GELU in the epilogue, the
+  second one accumulating into the learned positions; per block a layer norm, the fused q/k/v
+  multiply, flash attention on tensor cores (`attend.wgsl`: 64 queries × 64-key blocks, f16
+  operands, f32 scores, statistics and output; the rescale skipped when no row's maximum rose,
+  the next block's keys and values loaded while this one multiplies), the output projection and
+  the GELU feed-forward added into the residual stream by their epilogues; a final layer norm.
+  Then every decoder layer's cross-attention keys and values in one stacked multiply, rounded to
+  f16 into the window's decoder slot (the oracle's cache rounding).
+- **Decoder**, every window with a slot in lockstep, a token per step: weights as the file's
+  Q8_0 (`gemv.wgsl`: exact `scale · q`, half f16's bytes; the layer norm before a layer fused into
+  its multiply), self-attention keys and values cached in f16, cross-attention split over six
+  parts of the encoder positions so one window still fills the GPU, and the choice on the GPU
+  (`choose.wgsl`: suppression, the timestamp rules, argmax with its log-probability and margin).
+  Each slot's state lives on the GPU, so greedy steps go 8 (one window) or 16 (the pipeline) per
+  submit, two submits in flight, and only the state and choices come back. A fallback attempt
+  (temperature > 0) reads its slot's logits back each step and samples on the CPU with the
+  oracle's own code and seeded generator; its prompt's keys and values are reused from the first
+  attempt, and language detection's step is the first attempt's first.
+- **Pipeline** (`whisper/pipeline.rs`, `run_each`): mel features on their own thread, encoder
+  batches (4) between decoder runs, eight decoder slots; a window keeps its slot through its
+  passes and attempts. Without a language only the first unfinished window decodes until one has
+  text (the app's rule), so results are exactly `run`'s window by window.
+
+Measured on the RTX 4060 Laptop GPU (`cargo lab whisper`, GPU timestamps):
+
+| | Small | Turbo |
+| --- | ---: | ---: |
+| encoder, ms per 30 s window (any batch) | 20 | 118 |
+| — of it matrix multiplies, attention | 13, 5.5 | 89, 27 |
+| decoder step, 1 window | 1.45 ms | 1.15 ms |
+| decoder step, 8 windows (per window) | 3.8 ms (0.47) | 2.7 ms (0.33) |
+| a step past every window's end | 0.10 ms | 0.04 ms |
+
+What bounds it: the encoder's multiplies run at 21–22 TFLOP/s, about 92% of the 4060's f16
+tensor-core rate with f32 accumulation (24 SMs × 512 FLOP/clock × ~1.9 GHz). The reference gets
+its encoder speed differently: it quantizes activations to 8 bits and multiplies on int8 tensor
+cores, which wgpu doesn't expose (the adapter lists f16 cooperative matrices only); f16
+accumulation (F16→F16) measured no faster. A one-window decoder step is its ~110 (Small) or ~40
+(Turbo) dependent dispatches, each a few microseconds of launch and drain, plus 150–200 MB of
+weights and encoder keys and values. Eight windows in lockstep are bound by their encoder keys
+and values (55 MB per window per step for Small).
+
+Against the reference (`cargo lab bench --tier quick --models small,turbo --a ref --b vellum
+--blocks 4`, which runs each window through `run` as the app's harness does without a language):
+median speedup 1.49× for Small (95% interval 1.38–1.55), 1.32× for Turbo (1.30–1.34); short
+clips are their 30 s encoder pass and a few dozen decoder steps (Small 51–71 ms against 83–106,
+Turbo 144–163 ms against 196–218). With the pipeline, a long recording's windows decode in
+lockstep: 1.6–2× `run` window by window (`cargo lab whisper`'s pipeline check), which the
+harness doesn't exercise for a detecting model (it calls `transcribe` per window when no
+language is given).
+
+Unexplained: now and then the encoder's multiplies alone run about ten times slower for a few
+seconds (GPU timestamps confirm it; attention and the decoder in the same windows don't slow,
+SM and memory clocks stay up, nothing is evicted to shared memory). It costs one bench clip
+(Turbo on `librispeech-other/chapter-1688-142285`, 12 s against the reference's 7.2 s in three
+of four jobs; 5.5–6.7 s run alone).

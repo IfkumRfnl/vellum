@@ -1412,7 +1412,7 @@ fn positional_encodings(frames: usize, d_model: usize) -> Vec<f32> {
 
 /// The bytes of some f32s, as the GPU takes them (every target the engine builds for is
 /// little-endian).
-fn f32_bytes(data: &[f32]) -> &[u8] {
+pub(crate) fn f32_bytes(data: &[f32]) -> &[u8] {
     const { assert!(cfg!(target_endian = "little")) };
     // SAFETY: f32 has no padding and every byte is a valid u8; the same memory, as bytes.
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
@@ -1420,7 +1420,7 @@ fn f32_bytes(data: &[f32]) -> &[u8] {
 
 /// Waits for `submission` (or everything submitted), then reads spans (`(first value,
 /// values)`) of the first `bytes` of a mappable buffer as f32s, each its own vector.
-fn map_read(
+pub(crate) fn map_read(
     gpu: &Gpu,
     buffer: &wgpu::Buffer,
     bytes: u64,

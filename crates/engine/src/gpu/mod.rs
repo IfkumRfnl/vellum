@@ -383,6 +383,17 @@ impl Gpu {
         self.tensor(label, Dtype::F32, len, None)
     }
 
+    /// A persistent buffer of u32 words holding `data` (packed weights, tables, state).
+    pub fn upload_u32(&self, label: &str, data: &[u32]) -> Tensor {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.tensor(label, Dtype::U32, data.len(), Some(&bytes))
+    }
+
+    /// A buffer of `len` u32 words, zeroed.
+    pub fn zeros_u32(&self, label: &str, len: usize) -> Tensor {
+        self.tensor(label, Dtype::U32, len, None)
+    }
+
     /// Overwrites the start of a buffer with `data`.
     pub fn write_f32(&self, tensor: &Tensor, data: &[f32]) {
         assert!(tensor.dtype == Dtype::F32 && data.len() <= tensor.len);
@@ -636,12 +647,14 @@ fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
 pub enum Dtype {
     F32,
     F16,
+    /// Words of packed data (int8 weights, f16 pairs, bit masks, state).
+    U32,
 }
 
 impl Dtype {
     pub fn bytes(self) -> usize {
         match self {
-            Dtype::F32 => 4,
+            Dtype::F32 | Dtype::U32 => 4,
             Dtype::F16 => 2,
         }
     }

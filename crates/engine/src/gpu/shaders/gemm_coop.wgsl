@@ -25,7 +25,7 @@ struct Params {
     m: u32,
     n: u32,
     k: u32,
-    // Bit 0: add the bias. Bits 1–2: activation (0 none, 1 ReLU, 2 SiLU). Bit 3: accumulate.
+    // Bit 0: add the bias. Bits 1–2: activation (0 none, 1 ReLU, 2 SiLU, 3 GELU). Bit 3: accumulate.
     flags: u32,
     scale: f32,
 }
@@ -60,7 +60,20 @@ fn activate(v: f32, kind: u32) -> f32 {
     if kind == 2u {
         return v / (1.0 + exp(-v));
     }
+    if kind == 3u {
+        return 0.5 * v * (1.0 + erf(v * 0.70710678));
+    }
     return v;
+}
+
+// The error function as the CPU's `cpu::erf` computes it (Cody's rational approximation, to
+// about 1e-7), in f32.
+fn erf(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.5 * abs(x));
+    let y = 1.0 - t * exp(-x * x - 1.26551223 + t * (1.00002368 + t * (0.37409196
+        + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398
+        + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+    return select(-y, y, x >= 0.0);
 }
 
 @compute @workgroup_size(THREADS)

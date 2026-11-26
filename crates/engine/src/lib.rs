@@ -221,7 +221,6 @@ pub struct Transcriber {
 #[allow(clippy::large_enum_variant)]
 enum SpeechModel {
     Parakeet(parakeet::Parakeet),
-    /// On the CPU, whatever the device asked for (it has no GPU path yet).
     Whisper(whisper::Whisper),
 }
 
@@ -231,7 +230,7 @@ impl Transcriber {
         let (file, arch) = architecture(path)?;
         let model = match arch.as_str() {
             "parakeet" => SpeechModel::Parakeet(parakeet::Parakeet::load(&file, gpu(options)?)?),
-            "whisper" => SpeechModel::Whisper(whisper::Whisper::load(&file)?),
+            "whisper" => SpeechModel::Whisper(whisper::Whisper::load_on(&file, gpu(options)?)?),
             _ => return Err(Error::Unsupported(arch)),
         };
         let transcriber = Transcriber { model };
@@ -308,7 +307,7 @@ impl Transcriber {
     pub fn gpu(&self) -> Option<&gpu::Gpu> {
         match &self.model {
             SpeechModel::Parakeet(m) => m.gpu(),
-            SpeechModel::Whisper(_) => None,
+            SpeechModel::Whisper(m) => m.gpu(),
         }
     }
 }

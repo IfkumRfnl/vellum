@@ -1,6 +1,6 @@
 //! The matrix multiply every linear layer runs on: `Y[M,N] = X[M,K] · W[N,K]ᵀ + b` with f32
 //! activations, f16 weights, f32 accumulation and output, and a fused epilogue (bias, ReLU or
-//! SiLU, a scale, and accumulation into Y for residual adds).
+//! SiLU or GELU, a scale, and accumulation into Y for residual adds).
 //!
 //! Two kernels: [`Kind::Simt`], portable (register tiles over workgroup memory, plain f32
 //! arithmetic), and [`Kind::Coop`], tensor cores through WGSL cooperative matrices
@@ -121,6 +121,8 @@ pub enum Activation {
     None,
     Relu,
     Silu,
+    /// The exact (erf) form, as Whisper uses it.
+    Gelu,
 }
 
 /// What happens to `x·Wᵀ` before it's stored: `v = scale · act(x·Wᵀ + b)`, then `Y = v`, or
@@ -274,6 +276,7 @@ impl Gemm {
                 Activation::None => 0,
                 Activation::Relu => 1 << 1,
                 Activation::Silu => 2 << 1,
+                Activation::Gelu => 3 << 1,
             }
             | (u32::from(epilogue.accumulate) << 3);
         let mut immediates = Vec::with_capacity(IMMEDIATES as usize);
