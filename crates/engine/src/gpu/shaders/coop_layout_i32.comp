@@ -1,0 +1,27 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Which elements of a 16×16 i32 accumulator each lane holds: a matrix whose element
+// (row, col) is row·16 + col is loaded, and every lane writes its elements in order
+// (out[lane·16 + e]), then the count at out[lane·16 + 15]. `gemm_q8` scales each element
+// by its row's and column's quantization scales, so it needs the driver's arrangement.
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) buffer Out { int o[]; };
+shared int src[256];
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    for (uint i = lane; i < 256; i += 32) {
+        src[i] = int(i);
+    }
+    barrier();
+    coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
+    coopMatLoad(c, src, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    for (int e = 0; e < c.length() && e < 15; e++) {
+        o[lane * 16 + e] = c[e];
+    }
+    o[lane * 16 + 15] = c.length();
+}

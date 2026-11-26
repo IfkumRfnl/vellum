@@ -2,11 +2,13 @@
 //! activations, f16 weights, f32 accumulation and output, and a fused epilogue (bias, ReLU or
 //! SiLU or GELU, a scale, and accumulation into Y for residual adds).
 //!
-//! Two kernels: [`Kind::Simt`], portable (register tiles over workgroup memory, plain f32
-//! arithmetic), and [`Kind::Coop`], tensor cores through WGSL cooperative matrices
-//! (`coop_mat16x16`, f16 × f16 → f32), where [`Gpu::has_f16_tensor_cores`]. Shapes are
-//! immediates, never compiled in: one pipeline per tile variant, chosen per adapter by
-//! [`Gemm::autotune`].
+//! Four kernels: [`Kind::Simt`], portable (register tiles over workgroup memory, plain f32
+//! arithmetic); [`Kind::Coop`], tensor cores through WGSL cooperative matrices
+//! (`coop_mat16x16`, f16 × f16 → f32), where [`Gpu::has_f16_tensor_cores`]; and two int8
+//! ones on the file's own Q8_0 weights with activations quantized per 32 on the fly,
+//! [`Kind::Q8`] on int8 tensor cores (SPIR-V, Vulkan) and [`Kind::Dp4a`] on packed dot
+//! products (WGSL) (see [`super::q8`]). Shapes are immediates, never compiled in: one
+//! pipeline per tile variant, chosen per adapter by [`Gemm::autotune`].
 
 use super::{Dtype, Gpu, Kernel, Profiler, Tensor};
 use crate::{
@@ -20,12 +22,25 @@ pub const SIMT_SOURCE: &str = include_str!("shaders/gemm_simt.wgsl");
 pub const COOP_SOURCE: &str = include_str!("shaders/gemm_coop.wgsl");
 
 /// Bytes of immediate data both kernels take (`Params` in the shaders).
-const IMMEDIATES: u32 = 20;
+pub(super) const IMMEDIATES: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Simt,
     Coop,
+    /// Int8 tensor cores: Q8_0 weights × activations quantized to Q8_0 (layers whose
+    /// weights aren't Q8_0 go to an f16 kernel).
+    Q8,
+    /// The same arithmetic as [`Kind::Q8`] on packed int8 dot products (`dot4I8Packed`) in
+    /// WGSL: no tensor cores, portable.
+    Dp4a,
+}
+
+impl Kind {
+    /// Whether this multiply takes Q8_0 weights and quantizes its activations.
+    pub fn is_int8(self) -> bool {
+        matches!(self, Kind::Q8 | Kind::Dp4a)
+    }
 }
 
 /// A kernel and its tile shape: the output tile (`bm`×`bn`), the K slice staged per step
@@ -64,6 +79,28 @@ impl Variant {
         }
     }
 
+    pub const fn q8(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32) -> Variant {
+        Variant {
+            kind: Kind::Q8,
+            bm,
+            bn,
+            bk,
+            tm: wm,
+            tn: wn,
+        }
+    }
+
+    pub const fn dp4a(bm: u32, bn: u32, bk: u32, tm: u32, tn: u32) -> Variant {
+        Variant {
+            kind: Kind::Dp4a,
+            bm,
+            bn,
+            bk,
+            tm,
+            tn,
+        }
+    }
+
     /// The candidates autotuning measures.
     pub fn candidates(kind: Kind) -> &'static [Variant] {
         const SIMT: &[Variant] = &[
@@ -82,16 +119,47 @@ impl Variant {
             Variant::coop(128, 128, 32, 64, 64),
             Variant::coop(128, 128, 32, 32, 64),
         ];
+        const Q8: &[Variant] = &[
+            Variant::q8(128, 128, 64, 64, 32),
+            Variant::q8(128, 128, 64, 32, 64),
+            Variant::q8(128, 128, 128, 64, 32),
+            Variant::q8(64, 128, 64, 32, 64),
+            Variant::q8(128, 64, 64, 64, 32),
+            Variant::q8(64, 64, 64, 32, 32),
+            Variant::q8(128, 256, 64, 64, 64),
+            Variant::q8(256, 128, 64, 64, 64),
+            Variant::q8(128, 64, 128, 64, 32),
+            Variant::q8(64, 128, 128, 32, 64),
+            Variant::q8(64, 64, 128, 32, 32),
+            Variant::q8(128, 64, 64, 32, 32),
+            Variant::q8(128, 128, 64, 32, 32),
+            Variant::q8(256, 64, 64, 64, 32),
+            Variant::q8(64, 256, 64, 32, 64),
+            Variant::q8(128, 128, 128, 32, 64),
+            Variant::q8(128, 64, 128, 32, 32),
+        ];
+        const DP4A: &[Variant] = &[
+            Variant::dp4a(64, 64, 32, 4, 4),
+            Variant::dp4a(64, 64, 64, 4, 4),
+            Variant::dp4a(128, 64, 32, 8, 4),
+            Variant::dp4a(64, 128, 32, 4, 8),
+            Variant::dp4a(128, 128, 32, 8, 8),
+            Variant::dp4a(128, 64, 64, 8, 4),
+            Variant::dp4a(64, 128, 64, 4, 8),
+            Variant::dp4a(128, 128, 64, 8, 4),
+        ];
         match kind {
             Kind::Simt => SIMT,
             Kind::Coop => COOP,
+            Kind::Q8 => Q8,
+            Kind::Dp4a => DP4A,
         }
     }
 
     pub fn threads(&self) -> u32 {
         match self.kind {
-            Kind::Simt => (self.bm / self.tm) * (self.bn / self.tn),
-            Kind::Coop => (self.bm / self.tm) * (self.bn / self.tn) * 32,
+            Kind::Simt | Kind::Dp4a => (self.bm / self.tm) * (self.bn / self.tn),
+            Kind::Coop | Kind::Q8 => (self.bm / self.tm) * (self.bn / self.tn) * 32,
         }
     }
 
@@ -100,6 +168,9 @@ impl Variant {
         match self.kind {
             Kind::Simt => (self.bm + self.bn) * (self.bk + 4) * 4,
             Kind::Coop => (self.bm + self.bn) * (self.bk + 8) * 2 + self.threads() / 32 * 1024,
+            Kind::Q8 | Kind::Dp4a => {
+                (self.bm + self.bn) * (self.bk + 16) + (self.bm + self.bn) * self.bk / 8
+            }
         }
     }
 
@@ -108,6 +179,8 @@ impl Variant {
         let (kind, per) = match self.kind {
             Kind::Simt => ("simt", "t"),
             Kind::Coop => ("coop", "sg"),
+            Kind::Q8 => ("q8", "sg"),
+            Kind::Dp4a => ("dp4a", "t"),
         };
         format!(
             "{kind} {}×{}×{} {per}{}×{}",
@@ -144,11 +217,14 @@ impl Default for Epilogue {
     }
 }
 
-/// A linear layer on the GPU: `n` output rows of `k` f16 weights, and an optional f32 bias.
+/// A linear layer on the GPU: `n` output rows of `k` weights, and an optional f32 bias. The
+/// weights are f16, or with `scales` the file's Q8_0: int8 values four to a word (row-major)
+/// and an f32 scale per 32 (`[n][k/32]`), for the int8 multiplies.
 pub struct Weights {
     pub n: usize,
     pub k: usize,
     pub weight: Tensor,
+    pub scales: Option<Tensor>,
     pub bias: Option<Tensor>,
     /// How many weights f16 couldn't hold exactly (a Q8_0 value is an f16 scale times an int8,
     /// which can need up to 18 significant bits); each is off by at most half an f16 ulp.
@@ -163,9 +239,34 @@ impl Weights {
             n: linear.rows,
             k: linear.cols,
             weight: gpu.upload_f16(label, &w),
+            scales: None,
             bias: linear.bias.as_ref().map(|b| gpu.upload_f32(label, b)),
             inexact,
         }
+    }
+
+    /// Uploads a CPU layer for `kind`: as the file's Q8_0 for an int8 `kind` when its weight is
+    /// Q8_0 (and K a multiple of 32), else as f16.
+    pub fn upload_for(gpu: &Gpu, kind: Kind, label: &str, linear: &Linear) -> Weights {
+        match (&linear.weight, kind) {
+            (Weight::Q8(blocks), kind) if kind.is_int8() && linear.cols.is_multiple_of(32) => {
+                let (values, scales) = super::q8::pack(blocks);
+                super::q8::upload(
+                    gpu,
+                    label,
+                    (linear.rows, linear.cols),
+                    &values,
+                    &scales,
+                    linear.bias.as_deref(),
+                )
+            }
+            _ => Weights::upload(gpu, label, linear),
+        }
+    }
+
+    /// Whether these are Q8_0 weights for the int8 multiplies.
+    pub fn is_q8(&self) -> bool {
+        self.scales.is_some()
     }
 }
 
@@ -192,6 +293,9 @@ pub fn to_f16(linear: &Linear) -> (Vec<f16>, usize) {
 pub struct Gemm {
     pub variant: Variant,
     kernel: Arc<Kernel>,
+    /// The int8 multiplies' activation quantizer, its output, and the f16 kernel for layers
+    /// without Q8_0 weights.
+    q8: Option<super::q8::Parts>,
 }
 
 impl Gemm {
@@ -206,6 +310,9 @@ impl Gemm {
                 v.threads(),
                 v.shared_bytes()
             )));
+        }
+        if matches!(v.kind, Kind::Q8 | Kind::Dp4a) {
+            return super::q8::gemm(gpu, v);
         }
         let coop_source;
         let (name, source, consts) = match v.kind {
@@ -240,6 +347,7 @@ impl Gemm {
                     ],
                 )
             }
+            Kind::Q8 | Kind::Dp4a => unreachable!(),
         };
         let kernel = gpu.kernel(
             name,
@@ -248,7 +356,20 @@ impl Gemm {
             &[false, false, false, true],
             IMMEDIATES,
         )?;
-        Ok(Gemm { variant, kernel })
+        Ok(Gemm {
+            variant,
+            kernel,
+            q8: None,
+        })
+    }
+
+    /// An int8 multiply from its parts (see [`super::q8::gemm`]).
+    pub(super) fn from_q8(variant: Variant, kernel: Arc<Kernel>, parts: super::q8::Parts) -> Gemm {
+        Gemm {
+            variant,
+            kernel,
+            q8: Some(parts),
+        }
     }
 
     /// Records `y = epilogue(x · Wᵀ + b)` into `pass`. `k` must be a multiple of the
@@ -260,6 +381,14 @@ impl Gemm {
         op: &Operands,
         epilogue: Epilogue,
     ) {
+        if let Some(parts) = &self.q8 {
+            if op.weights.is_q8() {
+                parts.encode(gpu, pass, &self.kernel, self.variant, op, epilogue);
+            } else {
+                parts.fallback.encode(gpu, pass, op, epilogue);
+            }
+            return;
+        }
         let Operands { x, weights, y, m } = *op;
         let (n, k) = (weights.n, weights.k);
         assert!(
@@ -271,24 +400,7 @@ impl Gemm {
         assert!(y.dtype == Dtype::F32 && y.len >= m * n, "y is {m}×{n} f32");
         let bias = weights.bias.as_ref().unwrap_or(&weights.weight);
         let group = gpu.bind(&self.kernel, &[x, &weights.weight, bias, y]);
-        let flags = u32::from(weights.bias.is_some())
-            | match epilogue.activation {
-                Activation::None => 0,
-                Activation::Relu => 1 << 1,
-                Activation::Silu => 2 << 1,
-                Activation::Gelu => 3 << 1,
-            }
-            | (u32::from(epilogue.accumulate) << 3);
-        let mut immediates = Vec::with_capacity(IMMEDIATES as usize);
-        for v in [
-            m as u32,
-            n as u32,
-            k as u32,
-            flags,
-            epilogue.scale.to_bits(),
-        ] {
-            immediates.extend_from_slice(&v.to_le_bytes());
-        }
+        let immediates = immediates(m, weights, epilogue);
         pass.set_pipeline(&self.kernel.pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.set_immediates(0, &immediates);
@@ -297,6 +409,15 @@ impl Gemm {
             (m as u32).div_ceil(self.variant.bm),
             1,
         );
+    }
+
+    /// The multiply that runs `weights`: an int8 multiply's f16 fallback for layers without Q8_0
+    /// weights, else this one.
+    pub fn for_weights(&self, weights: &Weights) -> &Gemm {
+        match &self.q8 {
+            Some(parts) if !weights.is_q8() => &parts.fallback,
+            _ => self,
+        }
     }
 
     /// The fastest candidate of `kind` on this adapter, measured on Parakeet's two biggest
@@ -312,12 +433,20 @@ impl Gemm {
             .collect();
         let weights: Vec<Weights> = shapes
             .iter()
-            .map(|&(_, n, k)| Weights {
-                n,
-                k,
-                weight: gpu.upload_f16("autotune w", &w[..n * k]),
-                bias: None,
-                inexact: 0,
+            .map(|&(_, n, k)| match kind {
+                Kind::Q8 | Kind::Dp4a => {
+                    let q: Vec<f32> = w[..n * k].iter().map(|v| v.to_f32()).collect();
+                    let (values, scales) = super::q8::quantize(&q, k);
+                    super::q8::upload(gpu, "autotune w", (n, k), &values, &scales, None)
+                }
+                _ => Weights {
+                    n,
+                    k,
+                    weight: gpu.upload_f16("autotune w", &w[..n * k]),
+                    scales: None,
+                    bias: None,
+                    inexact: 0,
+                },
             })
             .collect();
         let ops: Vec<Operands> = shapes
@@ -421,6 +550,30 @@ impl Gemm {
             min: times[0],
         })
     }
+}
+
+/// The immediates every kernel takes (`Params` in the shaders): M, N, K, the epilogue's flags
+/// and scale.
+pub(super) fn immediates(m: usize, weights: &Weights, epilogue: Epilogue) -> Vec<u8> {
+    let flags = u32::from(weights.bias.is_some())
+        | match epilogue.activation {
+            Activation::None => 0,
+            Activation::Relu => 1 << 1,
+            Activation::Silu => 2 << 1,
+            Activation::Gelu => 3 << 1,
+        }
+        | (u32::from(epilogue.accumulate) << 3);
+    let mut immediates = Vec::with_capacity(IMMEDIATES as usize);
+    for v in [
+        m as u32,
+        weights.n as u32,
+        weights.k as u32,
+        flags,
+        epilogue.scale.to_bits(),
+    ] {
+        immediates.extend_from_slice(&v.to_le_bytes());
+    }
+    immediates
 }
 
 /// What one multiply reads and writes: `m` rows of `x` (`m`×`k` f32) times the layer's

@@ -1,0 +1,31 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const uint ITERS = 1024;
+layout(set = 0, binding = 0) buffer Out { int o[]; };
+shared int sa[16 * 8];
+shared int sc[4 * 256];
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    if (t < 128) sa[t] = int(t * 2654435761u);
+    barrier();
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a;
+    coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> b;
+    coopMatLoad(a, sa, 0, 8, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b, sa, 0, 8, gl_CooperativeMatrixLayoutColumnMajor);
+    coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 = coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 = c0, c2 = c0, c3 = c0, c4 = c0, c5 = c0, c6 = c0, c7 = c0;
+    for (uint i = 0; i < ITERS; i++) {
+        c0 = coopMatMulAdd(a, b, c0); c1 = coopMatMulAdd(a, b, c1);
+        c2 = coopMatMulAdd(a, b, c2); c3 = coopMatMulAdd(a, b, c3);
+        c4 = coopMatMulAdd(a, b, c4); c5 = coopMatMulAdd(a, b, c5);
+        c6 = coopMatMulAdd(a, b, c6); c7 = coopMatMulAdd(a, b, c7);
+    }
+    c0 = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7;
+    uint sg = t / 32;
+    coopMatStore(c0, sc, sg * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    if (t == 0) o[gl_WorkGroupID.x] = sc[5] + sc[700];
+}

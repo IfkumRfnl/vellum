@@ -111,7 +111,9 @@ pub fn encoder(args: &Args) -> Result<bool> {
         None => None,
         Some("simt") => Some(Kind::Simt),
         Some("coop") => Some(Kind::Coop),
-        Some(other) => anyhow::bail!("--kernel {other}: simt or coop"),
+        Some("q8") => Some(Kind::Q8),
+        Some("dp4a") => Some(Kind::Dp4a),
+        Some(other) => anyhow::bail!("--kernel {other}: simt, coop, q8 or dp4a"),
     };
     let mut tuning = String::new();
     let variant = match (kind, args.autotune) {
@@ -142,19 +144,23 @@ pub fn encoder(args: &Args) -> Result<bool> {
             tm: 32,
             tn: 64,
         }),
+        (Some(Kind::Q8), false) => Some(vellum_engine::gpu::q8::DEFAULT),
+        (Some(Kind::Dp4a), false) => Some(vellum_engine::gpu::q8::DP4A_DEFAULT),
         (None, false) => None,
     };
     let started = Instant::now();
     let encoder_options = GpuEncoderOptions {
         gemm: variant,
         max_batch: args.batch.max(8),
+        // Parakeet's own default: int8 where it's faster.
+        int8: true,
         ..GpuEncoderOptions::default()
     };
     let encoder = GpuEncoder::load_with(&gpu, &file, &hparams, &encoder_options)?;
     let gpu_load = ms(started);
     gpu.save_pipeline_cache()?;
     let setup = format!(
-        "{}\nmultiply: {}{tuning}\nCPU oracle loaded in {cpu_load:.0} ms, GPU encoder in {gpu_load:.0} ms (weights to f16, positional table, kernels)",
+        "{}\nmultiply: {}{tuning}\nCPU oracle loaded in {cpu_load:.0} ms, GPU encoder in {gpu_load:.0} ms (weights, positional table, kernels)",
         gpu.name(),
         encoder.gemm_variant().name(),
     );

@@ -18,7 +18,7 @@ use crate::{
     parakeet::gpu_encoder::{
         LAYER_NORM, f32_bytes, map_read,
         record::{Recorder, Timing},
-        stacked, upload_linear,
+        stacked_for, upload_linear_for,
     },
     whisper::HParams,
 };
@@ -74,8 +74,11 @@ pub struct Encoder {
 }
 
 /// Bytes the encoder's activations (a batch's residual stream, multiply outputs and the
-/// like) may take on the GPU.
-const ACTIVATION_BUDGET: usize = 192 << 20;
+/// like) may take on the GPU. Small enough for one Turbo window: on an RTX 4060 Laptop GPU
+/// the f16 multiplies over two Turbo windows' activations (and Small's over eight) fall into
+/// sustained slow spells, every tensor-core kernel 8–10× slower in a fixed cycle (see
+/// GPU.md), which one window never does; a window costs the same in any batch.
+const ACTIVATION_BUDGET: usize = 96 << 20;
 
 impl Encoder {
     pub fn load(
@@ -92,7 +95,12 @@ impl Encoder {
                 hp.frames
             )));
         }
-        let variant = options.gemm.unwrap_or_else(super::default_variant);
+        let variant = options
+            .gemm
+            // f16: Whisper's transcripts move under 8-bit activations (GPU.md).
+            .unwrap_or_else(|| crate::gpu::q8::choose(gpu, super::default_variant(), false));
+        // Layers as the file's Q8_0 for the int8 multiply (f16 for the rest).
+        let kind = variant.kind;
         let gemm = Gemm::new(gpu, variant)?;
         let bk = variant.bk as usize;
         let attention = [
@@ -131,22 +139,23 @@ impl Encoder {
                 let name = |part: &str| format!("enc.blocks.{l}.{part}");
                 Ok(Block {
                     norm_attn: Norm::load(gpu, file, &name("norm_attn"))?,
-                    qkv: stacked(
+                    qkv: stacked_for(
                         gpu,
                         file,
                         "attn.qkv",
                         &["q", "k", "v"].map(|p| name(&format!("attn.{p}"))),
+                        kind,
                     )?,
-                    out: upload_linear(gpu, file, &name("attn.out"), "attn.out")?,
+                    out: upload_linear_for(gpu, file, &name("attn.out"), "attn.out", kind)?,
                     norm_ffn: Norm::load(gpu, file, &name("norm_ffn"))?,
-                    fc1: upload_linear(gpu, file, &name("ffn.fc1"), "ffn.fc1")?,
-                    fc2: upload_linear(gpu, file, &name("ffn.fc2"), "ffn.fc2")?,
+                    fc1: upload_linear_for(gpu, file, &name("ffn.fc1"), "ffn.fc1", kind)?,
+                    fc2: upload_linear_for(gpu, file, &name("ffn.fc2"), "ffn.fc2", kind)?,
                 })
             })
             .collect::<Result<Vec<Block>>>()?;
         let d_ff = blocks.first().map_or(4 * d, |b| b.fc1.n);
         // A window costs the same GPU time in any batch, so the batch is only as large as its
-        // activations' budget allows: 4 windows for Small, 2 for Turbo (whose activations are
+        // activations' budget allows: 2 windows for Small, 1 for Turbo (whose activations are
         // 79 MB a window, memory the driver also charges to the system's commit).
         let per_window = 4
             * (MEL_FRAMES * mels
@@ -429,6 +438,26 @@ impl Encoder {
         );
     }
 
+    /// The last block's fc2 multiply on `windows` windows' rows, into `pass` (the lab's
+    /// sustained-load test of one multiply on the encoder's own buffers).
+    pub fn record_last_fc2(&self, pass: &mut wgpu::ComputePass, windows: usize) {
+        let b = &self.buffers;
+        let Some(block) = self.blocks.last() else {
+            return;
+        };
+        let op = Operands {
+            x: &b.hidden,
+            weights: &block.fc2,
+            y: &b.residual,
+            m: windows.min(self.max_batch) * FRAMES,
+        };
+        let add = Epilogue {
+            accumulate: true,
+            ..Epilogue::default()
+        };
+        self.gemm.encode(&self.gpu, pass, &op, add);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemm(
         &self,
@@ -482,6 +511,7 @@ fn conv(gpu: &Gpu, file: &Gguf, name: &str, bk: usize) -> Result<Conv> {
             n: outputs,
             k: width,
             weight: gpu.upload_f16(name, &out),
+            scales: None,
             bias: Some(gpu.upload_f32(name, &bias)),
             inexact: 0,
         },

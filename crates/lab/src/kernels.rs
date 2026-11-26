@@ -4,9 +4,11 @@
 //! window (M = 350 frames) and batches of 4 and 8 (1400, 2800), with the real weights from the
 //! GGUF and synthetic activations at the scale each layer sees. Each kernel's output is checked
 //! against `cpu::Linear::forward` with the exactly dequantized weights — relative L2 error and
-//! max |Δ| — next to the floor its rounding can't go under (weights to f16 for both kernels,
-//! activations to f16 too for the cooperative one), then timed with GPU timestamps (median of
-//! `--runs` calls after warm-up). The kernel dev loop: one command, seconds.
+//! max |Δ| — next to the floor its rounding can't go under (weights to f16 for the f16
+//! kernels, activations to f16 too for the cooperative one; for the int8 one the weights are
+//! exact and the activations quantized per 32 as the kernel does it), then timed with GPU
+//! timestamps (median of `--runs` calls after warm-up). The kernel dev loop: one command,
+//! seconds.
 
 use crate::{models, paths, report::Report, system};
 use anyhow::{Context, Result};
@@ -197,6 +199,20 @@ pub fn kernels(args: &Args) -> Result<bool> {
             println!("no f16 16×16×16 cooperative matrices on this adapter: SIMT only");
         }
     }
+    if wanted("q8") {
+        if gpu::q8::available(&gpu) {
+            kinds.push(Kind::Q8);
+        } else {
+            println!("no int8 multiply on this adapter (VELLUM_GPU_VERBOSE=1 says why)");
+        }
+    }
+    if wanted("dp4a") {
+        if gpu::q8::dp4a_available(&gpu) {
+            kinds.push(Kind::Dp4a);
+        } else {
+            println!("no packed int8 multiply on this adapter (VELLUM_GPU_VERBOSE=1 says why)");
+        }
+    }
 
     // Every candidate compiled up front, to see what the pipeline cache saves (a second run
     // should take a fraction of the first).
@@ -244,6 +260,27 @@ pub fn kernels(args: &Args) -> Result<bool> {
     }
     report.section("Autotune", tune);
 
+    // The adapter's peak multiply rates, from loops with no memory traffic.
+    let mut peaks = String::from(
+        "| unit | TOPS |
+| --- | ---: |
+",
+    );
+    for (name, tops) in gpu::q8::peaks(&gpu) {
+        let cell = match tops {
+            Ok(t) => format!("{t:.1}"),
+            Err(e) => format!("— ({})", first_line(&e.to_string())),
+        };
+        writeln!(peaks, "| {name} | {cell} |")?;
+    }
+    print!("{peaks}");
+    if let Ok(layout) = gpu::q8::accumulator_layout(&gpu) {
+        for (lane, e) in layout.iter().enumerate().take(8) {
+            println!("lane {lane}: {e:?}");
+        }
+    }
+    report.section("Peak rates", peaks);
+
     let path = models::get("parakeet")?.ensure()?;
     let file = Gguf::open(&path)?;
     let rows_list = if args.rows.is_empty() {
@@ -266,6 +303,7 @@ pub fn kernels(args: &Args) -> Result<bool> {
         }
         let linear = fused(&file, shape.tensors)?;
         let weights = Weights::upload(&gpu, shape.label, &linear);
+        let q8_weights = Weights::upload_for(&gpu, Kind::Q8, shape.label, &linear);
         let (n, k) = (linear.rows, linear.cols);
         writeln!(
             weights_note,
@@ -290,6 +328,12 @@ pub fn kernels(args: &Args) -> Result<bool> {
                 &apply(&w16.forward(&f16_mat(&x)), shape.epilogue).data,
                 &reference.data,
             );
+            // The int8 kernel's: exact weights, activations quantized per 32.
+            let xq = Mat::from_vec(m, k, gpu::q8::dequantize(&gpu::q8::quantize(&x.data, k)));
+            let floor_q8 = rel_l2(
+                &apply(&linear.forward(&xq), shape.epilogue).data,
+                &reference.data,
+            );
             let residual: Vec<f32> = noise(m * n, 7).iter().map(|v| v * 4.).collect();
             let gx = gpu.upload_f32("x", &x.data);
             for gemm in &gemms {
@@ -303,7 +347,7 @@ pub fn kernels(args: &Args) -> Result<bool> {
                     let mut pass = encoder.begin_compute_pass(&Default::default());
                     let op = Operands {
                         x: &gx,
-                        weights: &weights,
+                        weights: weights_for(gemm, &weights, &q8_weights),
                         y: &gy,
                         m,
                     };
@@ -326,6 +370,7 @@ pub fn kernels(args: &Args) -> Result<bool> {
                 let floor = match gemm.variant.kind {
                     Kind::Simt => floor_w,
                     Kind::Coop => floor_wx,
+                    Kind::Q8 | Kind::Dp4a => floor_q8,
                 };
                 rows.push(Row {
                     shape: shape.label.into(),
@@ -347,7 +392,7 @@ pub fn kernels(args: &Args) -> Result<bool> {
             }
             gpu.clear_bind_groups();
         }
-        layers.push((shape, weights));
+        layers.push((shape, weights, q8_weights));
     }
 
     // Timing: `rounds` passes over every measurement, keeping each one's best median, so a
@@ -356,19 +401,19 @@ pub fn kernels(args: &Args) -> Result<bool> {
     let mut warm = false;
     for _ in 0..args.rounds.max(1) {
         let mut timed = rows.iter_mut();
-        for (shape, weights) in &layers {
+        for (shape, weights, q8_weights) in &layers {
             let (n, k) = (weights.n, weights.k);
             for &m in &rows_list {
                 let x = input(shape.input, m, k, m as u64 ^ k as u64);
                 let gx = gpu.upload_f32("x", &x.data);
                 let gy = gpu.zeros_f32("y", m * n);
-                let op = Operands {
-                    x: &gx,
-                    weights,
-                    y: &gy,
-                    m,
-                };
                 for gemm in &gemms {
+                    let op = Operands {
+                        x: &gx,
+                        weights: weights_for(gemm, weights, q8_weights),
+                        y: &gy,
+                        m,
+                    };
                     if !warm {
                         gemm.warm_up(&gpu, &op, Duration::from_millis(500))?;
                         warm = true;
@@ -390,7 +435,12 @@ pub fn kernels(args: &Args) -> Result<bool> {
         let (m, n, k) = (row.m, row.n, row.k);
         let flops = 2. * (m * n * k) as f64;
         let y_bytes = m * n * 4 * (1 + usize::from(row.accumulate));
-        let bytes = (n * k * 2 + m * k * 4 + y_bytes) as f64;
+        let w_bytes = if row.kernel.starts_with("q8") || row.kernel.starts_with("dp4a") {
+            n * k + n * k / 8
+        } else {
+            n * k * 2
+        };
+        let bytes = (w_bytes + m * k * 4 + y_bytes) as f64;
         row.tflops = flops / (row.ms * 1e-3) / 1e12;
         row.gbps = bytes / (row.ms * 1e-3) / 1e9;
         println!(
@@ -443,9 +493,11 @@ pub fn kernels(args: &Args) -> Result<bool> {
              floor is the same product on the CPU with the kernel's rounding (weights to f16; \
              for the cooperative kernel activations to f16 as well); a kernel passes within 1.5× \
              its floor + 1e-5. Accumulating layers are checked on what they added to a random \
-             residual. Times are GPU timestamps around one call: the median of {} calls after 5 \
+             residual. Times are GPU timestamps around one call (for the int8 kernel, its \
+             activations' quantization and the multiply): the median of {} calls after 5 \
              warm-up calls, the best of {} rounds over all measurements (TFLOP/s and GB/s \
-             from it), and the fastest call seen. GB/s counts weights, activations and output \
+             from it; for the int8 kernel tera-operations, a multiply-add being 2), and the \
+             fastest call seen. GB/s counts weights, activations and output \
              once (output twice when accumulating).\n\n{weights_note}",
             args.runs, args.rounds
         ),
@@ -458,6 +510,11 @@ pub fn kernels(args: &Args) -> Result<bool> {
     });
     println!("{}", report.save()?.display());
     Ok(report.passed)
+}
+
+/// The weights `gemm` multiplies by: Q8_0 for the int8 kernel, else f16.
+fn weights_for<'a>(gemm: &Gemm, f16: &'a Weights, q8: &'a Weights) -> &'a Weights {
+    if gemm.variant.kind.is_int8() { q8 } else { f16 }
 }
 
 /// Several layers stacked into one (their rows in order), like the fused q, k, v.

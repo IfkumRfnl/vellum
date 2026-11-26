@@ -38,10 +38,19 @@ pub struct Sample {
     pub memory_used_mb: Option<u32>,
     /// NVML's clock event (throttle) reasons bitmask, `nvmlClocksEventReason*`.
     pub reasons: Option<u64>,
+    /// Percent of the last sample period device memory was being read or written.
+    #[serde(default)]
+    pub memory_utilization: Option<u32>,
+    /// The PCIe link as it runs now (it drops gen and width to save power).
+    #[serde(default)]
+    pub pcie_gen: Option<u32>,
+    #[serde(default)]
+    pub pcie_width: Option<u32>,
 }
 
 /// Reads every field once. NVML calls only: nothing here allocates.
 pub(super) fn read(device: &Device, t0: Instant) -> Sample {
+    let utilization = device.utilization_rates().ok();
     Sample {
         t_ms: t0.elapsed().as_millis() as u32,
         sm_mhz: device.clock_info(Clock::SM).ok(),
@@ -49,9 +58,12 @@ pub(super) fn read(device: &Device, t0: Instant) -> Sample {
         memory_mhz: device.clock_info(Clock::Memory).ok(),
         temperature_c: device.temperature(TemperatureSensor::Gpu).ok(),
         power_mw: device.power_usage().ok(),
-        utilization: device.utilization_rates().ok().map(|u| u.gpu),
+        utilization: utilization.as_ref().map(|u| u.gpu),
         memory_used_mb: device.memory_info().ok().map(|m| (m.used >> 20) as u32),
         reasons: device.current_throttle_reasons().ok().map(|r| r.bits()),
+        memory_utilization: utilization.map(|u| u.memory),
+        pcie_gen: device.current_pcie_link_gen().ok(),
+        pcie_width: device.current_pcie_link_width().ok(),
     }
 }
 

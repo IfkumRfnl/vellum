@@ -9,6 +9,8 @@
 //! Storage is f16 for weights and f32 for everything else; shaders accumulate in f32.
 
 pub mod gemm;
+pub mod q8;
+mod spirv;
 
 /// The f16 type weights are uploaded as.
 pub use half::f16;
@@ -25,10 +27,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use wgpu::util::DeviceExt;
 
 /// Every embedded shader, for the pipeline cache's key: a changed shader starts a new cache.
-const SHADERS: &[&str] = &[gemm::SIMT_SOURCE, gemm::COOP_SOURCE];
+const SHADERS: &[&str] = &[
+    gemm::SIMT_SOURCE,
+    gemm::COOP_SOURCE,
+    q8::QUANTIZE_SOURCE,
+    q8::DP4A_SOURCE,
+];
 
 /// Bytes of initialized buffers between flushes while a model loads. wgpu stages each
 /// buffer's contents in host memory until the next submit completes, so without flushes a
@@ -76,6 +82,7 @@ fn wanted_features() -> wgpu::Features {
         | F::TIMESTAMP_QUERY_INSIDE_PASSES
         | F::PIPELINE_CACHE
         | F::EXPERIMENTAL_COOPERATIVE_MATRIX
+        | F::PASSTHROUGH_SHADERS
 }
 
 /// Every adapter the built-in backends see, in the order `VELLUM_GPU=<index>` counts them.
@@ -122,6 +129,12 @@ pub struct Gpu {
     /// The first failure nobody scoped (out of memory, the device lost), reported by the next
     /// wait or readback (see [`check`](Self::check)).
     failure: Arc<Mutex<Option<String>>>,
+    /// Whether the int8 multiply runs here ([`q8::available`]), once measured.
+    q8_checked: std::sync::OnceLock<bool>,
+    /// Whether the packed int8 multiply runs here ([`q8::dp4a_available`]), once measured.
+    dp4a_checked: std::sync::OnceLock<bool>,
+    /// The int8 multiply models that allow one get, once measured ([`q8::choose`]).
+    int8_choice: std::sync::OnceLock<gemm::Variant>,
 }
 
 /// The usual case — no adapter or backend asked for — without starting every backend: listing
@@ -281,6 +294,9 @@ impl Gpu {
             next_id: AtomicU64::new(1),
             unflushed: AtomicU64::new(0),
             failure,
+            q8_checked: std::sync::OnceLock::new(),
+            dp4a_checked: std::sync::OnceLock::new(),
+            int8_choice: std::sync::OnceLock::new(),
         })
     }
 
@@ -357,6 +373,11 @@ impl Gpu {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// A buffer of `len` values, holding `bytes` if given (else zeros). An allocation the
+    /// device can't make (out of GPU memory) doesn't panic: the buffer is left invalid, its
+    /// contents unwritten, and the failure kept for the next [`check`](Self::check), which a
+    /// model's load ([`allocating`](Self::allocating)) and every wait or readback make. (wgpu's
+    /// `create_buffer_init` maps the new buffer and panics when it's invalid.)
     fn tensor(&self, label: &str, dtype: Dtype, len: usize, bytes: Option<&[u8]>) -> Tensor {
         let usage = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_SRC
@@ -364,36 +385,32 @@ impl Gpu {
         // Bindings stay under the adapter's per-binding cap; a model's tensors fit easily
         // (the largest Parakeet weight is 8 MiB in f16).
         let size = (len * dtype.bytes()).next_multiple_of(4).max(4) as u64;
-        let buffer = match bytes {
-            Some(bytes) if bytes.len() as u64 == size => {
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some(label),
-                        contents: bytes,
-                        usage,
-                    })
-            }
-            Some(bytes) => {
+        // Error scopes are per thread, and this one holds only the allocation.
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        if let Some(e) = block_on(scope.pop()) {
+            self.keep_failure(format!(
+                "GPU out of memory allocating {label} ({:.1} MiB) on {}: {e}",
+                size as f64 / (1 << 20) as f64,
+                self.info.name
+            ));
+        } else if let Some(bytes) = bytes {
+            // Staged in host memory until the next submit, like `create_buffer_init`'s copy.
+            if bytes.len() as u64 == size {
+                self.queue.write_buffer(&buffer, 0, bytes);
+            } else {
                 let mut padded = bytes.to_vec();
                 padded.resize(size as usize, 0);
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some(label),
-                        contents: &padded,
-                        usage,
-                    })
+                self.queue.write_buffer(&buffer, 0, &padded);
             }
-            None => self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage,
-                mapped_at_creation: false,
-            }),
-        };
-        if bytes.is_some()
-            && self.unflushed.fetch_add(size, Ordering::Relaxed) + size > UPLOAD_FLUSH_BYTES
-        {
-            self.flush_uploads();
+            if self.unflushed.fetch_add(size, Ordering::Relaxed) + size > UPLOAD_FLUSH_BYTES {
+                self.flush_uploads();
+            }
         }
         Tensor {
             buffer,
@@ -401,6 +418,14 @@ impl Gpu {
             dtype,
             id: self.id(),
         }
+    }
+
+    /// Keeps `failure` for the next [`check`](Self::check), unless one is already kept.
+    fn keep_failure(&self, failure: String) {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(failure);
     }
 
     /// Submits the uploads so far and waits for them, which frees their staging memory.
@@ -425,17 +450,22 @@ impl Gpu {
     }
 
     /// Runs `f` (allocations: a model's load) with out-of-memory errors scoped: an allocation
-    /// the device can't make fails `f`'s result instead of leaving an invalid buffer.
+    /// the device can't make fails `f`'s result instead of leaving an invalid buffer. So does
+    /// any failure kept meanwhile (a buffer [`tensor`](Self::tensor) couldn't allocate, on
+    /// any thread).
     pub fn allocating<T>(&self, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let result = f();
         self.flush_uploads();
-        match block_on(scope.pop()) {
-            Some(e) => Err(Error::Other(format!(
+        let scoped = block_on(scope.pop());
+        let kept = self.check();
+        match (scoped, kept) {
+            (Some(e), _) => Err(Error::Other(format!(
                 "GPU out of memory loading {what} on {}: {e}",
                 self.info.name
             ))),
-            None => result,
+            (None, Err(e)) => Err(Error::Other(format!("loading {what}: {e}"))),
+            (None, Ok(())) => result,
         }
     }
 
@@ -581,6 +611,70 @@ impl Gpu {
                     .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
             }
         };
+        self.finish_kernel(key, scope, &module, bindings, immediates)
+    }
+
+    /// A compute kernel from SPIR-V (Vulkan only, with `PASSTHROUGH_SHADERS`): for what WGSL
+    /// can't say, such as int8 cooperative matrices. `spirv` is the module as `glslc` wrote
+    /// it, entry point `main`; `specialize` sets its specialization constants (`SpecId`,
+    /// value), which wgpu doesn't pass to a raw module, by rewriting their defaults. Bindings
+    /// and immediates as for [`kernel`](Self::kernel). The module bypasses wgpu's validation,
+    /// so the caller checks its results (the lab does, against the CPU).
+    pub fn kernel_spirv(
+        &self,
+        name: &str,
+        spirv: &[u8],
+        specialize: &[(u32, u32)],
+        bindings: &[bool],
+        immediates: u32,
+    ) -> Result<Arc<Kernel>> {
+        let mut key = name.to_owned();
+        for (k, v) in specialize {
+            key.push_str(&format!(" {k}={v}"));
+        }
+        if let Some(k) = self.kernels.lock().unwrap().get(&key) {
+            return Ok(k.clone());
+        }
+        if self.info.backend != wgpu::Backend::Vulkan
+            || !self.has(wgpu::Features::PASSTHROUGH_SHADERS)
+        {
+            return Err(Error::Unsupported(format!(
+                "SPIR-V kernels on {} ({:?})",
+                self.info.name, self.info.backend
+            )));
+        }
+        let words = spirv::specialize(spirv, specialize)
+            .map_err(|e| Error::Other(format!("kernel {key}: {e}")))?;
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        // SAFETY: the module is the engine's own, compiled by glslc from `gpu/shaders/` for
+        // Vulkan 1.3 and needing only features the device has (cooperative matrices, int8);
+        // its bindings and immediates match the layout below.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                    label: Some(&key),
+                    entry_points: std::borrow::Cow::Owned(vec![
+                        wgpu::PassthroughShaderEntryPoint {
+                            name: "main".into(),
+                            workgroup_size: (0, 0, 0),
+                        },
+                    ]),
+                    spirv: Some(std::borrow::Cow::Owned(words)),
+                    ..Default::default()
+                })
+        };
+        self.finish_kernel(key, scope, &module, bindings, immediates)
+    }
+
+    /// The pipeline and layouts of a kernel whose module is made, under `scope`'s validation.
+    fn finish_kernel(
+        &self,
+        key: String,
+        scope: wgpu::ErrorScopeGuard,
+        module: &wgpu::ShaderModule,
+        bindings: &[bool],
+        immediates: u32,
+    ) -> Result<Arc<Kernel>> {
         let entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
             .iter()
             .enumerate()
@@ -613,7 +707,7 @@ impl Gpu {
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(&key),
                 layout: Some(&pipeline_layout),
-                module: &module,
+                module,
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &[],

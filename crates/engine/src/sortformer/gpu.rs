@@ -52,7 +52,9 @@ impl GpuSortformer {
             ..GpuEncoderOptions::default()
         };
         let encoder = GpuEncoder::load_with(gpu, file, &hparams.encoder, &options)?;
-        let tail = Transformer::load(gpu, file, hparams, encoder.gemm_variant(), max_frames)?;
+        let tail = gpu.allocating("Sortformer", || {
+            Transformer::load(gpu, file, hparams, encoder.gemm_variant(), max_frames)
+        })?;
         Ok(GpuSortformer {
             gpu: gpu.clone(),
             encoder,

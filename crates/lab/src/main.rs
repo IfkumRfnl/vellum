@@ -17,6 +17,7 @@ mod reference;
 mod report;
 mod run;
 mod score;
+mod sustain;
 mod system;
 mod whisper;
 
@@ -114,7 +115,7 @@ enum Command {
     },
     /// The GPU kernels on Parakeet's real shapes: error against the CPU, GPU time, TFLOP/s.
     Kernels {
-        /// Kernels to run (default all the adapter has): simt, coop.
+        /// Kernels to run (default all the adapter has): simt, coop, q8.
         #[arg(long, value_delimiter = ',')]
         kernels: Vec<String>,
         /// Rows per call: frames per batch (default 350, 1400, 2800).
@@ -144,7 +145,7 @@ enum Command {
         /// Windows encoded together for the batch check.
         #[arg(long, default_value_t = 4)]
         batch: usize,
-        /// The multiply: simt or coop (default: tensor cores where the adapter has them).
+        /// The multiply: simt, coop or q8 (default: tensor cores where the adapter has them).
         #[arg(long)]
         kernel: Option<String>,
         /// Pick the multiply's tile shape by measuring it on this adapter.
@@ -190,6 +191,11 @@ enum Command {
         /// A long clip for the pipeline check (empty: none).
         #[arg(long, default_value = "youtube/ted-30-days")]
         pipeline: String,
+        /// Instead of the checks: the encoder alone, batch after batch, for this many seconds,
+        /// each batch's GPU time next to NVML's clocks, memory load and PCIe link (`--batch`
+        /// windows; 0 for the encoder's own batch size).
+        #[arg(long)]
+        sustain: Option<f64>,
     },
     /// Downloads and prepares the recordings a tier needs.
     Fetch {
@@ -361,7 +367,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             backend,
             explain,
             pipeline,
+            sustain,
         } => {
+            if let Some(seconds) = sustain {
+                return Ok(code(sustain::sustain(&sustain::Args {
+                    model,
+                    seconds,
+                    batch,
+                    adapter,
+                })?));
+            }
             return Ok(code(whisper::whisper(&whisper::Args {
                 model,
                 clips,

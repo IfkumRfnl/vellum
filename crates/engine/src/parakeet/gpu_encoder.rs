@@ -22,7 +22,7 @@ use crate::{
     cpu::{Linear, Mat, vector},
     gguf::Gguf,
     gpu::{
-        Gpu, Kernel, Profiler, Tensor, f16,
+        self, Gpu, Kernel, Profiler, Tensor, f16,
         gemm::{self, Activation, Epilogue, Gemm, Kind, Operands, Variant, Weights},
     },
 };
@@ -57,6 +57,9 @@ pub struct GpuEncoderOptions {
     /// The most encoder frames a window can have, when it's more than the longest mel window
     /// subsampled: Sortformer encodes its speaker cache and newest chunk together.
     pub max_frames: Option<usize>,
+    /// Whether the default multiply may be int8 (8-bit activations, [`gpu::q8::choose`]):
+    /// Parakeet's transcripts hold up under them; Sortformer's encoder keeps f16 (unchecked).
+    pub int8: bool,
 }
 
 impl Default for GpuEncoderOptions {
@@ -68,14 +71,21 @@ impl Default for GpuEncoderOptions {
             max_mel_frames: 3072,
             rows_per_submit: 6000,
             max_frames: None,
+            int8: false,
         }
     }
 }
 
 /// The tile shapes that measure best on an RTX 4060 (`cargo lab kernels`). K steps of 64
 /// rather than 32 make no difference to a long recording and take a short window's encoding
-/// from 13.5 to 11.5 ms (it's bound by streaming the weights, at any length).
-fn default_variant(gpu: &Gpu) -> Variant {
+/// from 13.5 to 11.5 ms (it's bound by streaming the weights, at any length). With `int8`,
+/// an int8 multiply instead where one runs and measures faster ([`gpu::q8::choose`]).
+fn default_variant(gpu: &Gpu, int8: bool) -> Variant {
+    gpu::q8::choose(gpu, f16_variant(gpu), int8)
+}
+
+/// The f16 multiply: tensor cores where the adapter has them, else the portable kernel.
+fn f16_variant(gpu: &Gpu) -> Variant {
     let (kind, bm, bn, bk, tm, tn) = if gpu.has_f16_tensor_cores() {
         (Kind::Coop, 64, 128, 64, 32, 64)
     } else {
@@ -248,11 +258,30 @@ struct Window {
 }
 
 impl GpuEncoder {
+    /// Parakeet's encoder: int8 multiplies where they run faster (its transcripts hold up
+    /// under 8-bit activations, GPU.md).
     pub fn load(gpu: &Arc<Gpu>, file: &Gguf, hparams: &HParams) -> Result<GpuEncoder> {
-        GpuEncoder::load_with(gpu, file, hparams, &GpuEncoderOptions::default())
+        let options = GpuEncoderOptions {
+            int8: true,
+            ..GpuEncoderOptions::default()
+        };
+        GpuEncoder::load_with(gpu, file, hparams, &options)
     }
 
+    /// The encoder with `options`. Out of GPU memory (or the host's, for staging) fails the
+    /// load rather than leaving invalid buffers behind.
     pub fn load_with(
+        gpu: &Arc<Gpu>,
+        file: &Gguf,
+        hparams: &HParams,
+        options: &GpuEncoderOptions,
+    ) -> Result<GpuEncoder> {
+        gpu.allocating("the encoder", || {
+            GpuEncoder::load_unscoped(gpu, file, hparams, options)
+        })
+    }
+
+    fn load_unscoped(
         gpu: &Arc<Gpu>,
         file: &Gguf,
         hparams: &HParams,
@@ -291,7 +320,14 @@ impl GpuEncoder {
                 dims.d_model, dims.heads, hparams.subsampling_factor, dims.channels
             )));
         }
-        let gemm = Gemm::new(gpu, options.gemm.unwrap_or_else(|| default_variant(gpu)))?;
+        let gemm = Gemm::new(
+            gpu,
+            options
+                .gemm
+                .unwrap_or_else(|| default_variant(gpu, options.int8)),
+        )?;
+        // Layers as the file's Q8_0 for the int8 multiply (f16 for the rest).
+        let kind = gemm.variant.kind;
         let c4 = (dims.channels / 4) as u32;
         let m4 = (dims.d_model / 4) as u32;
         let attention = [
@@ -355,7 +391,7 @@ impl GpuEncoder {
             .map(|l| -> Result<(Block, Weights)> {
                 let name = format!("enc.blocks.{l}");
                 Ok((
-                    load_block(gpu, file, &name, &dims)?,
+                    load_block(gpu, file, &name, &dims, kind)?,
                     upload_linear(gpu, file, &format!("{name}.attn.linear_pos"), "linear_pos")?,
                 ))
             })
@@ -386,7 +422,13 @@ impl GpuEncoder {
         gpu.clear_bind_groups();
 
         let joint = match file.tensor("joint.enc.weight") {
-            Some(_) => Some(upload_linear(gpu, file, "joint.enc", "joint.enc")?),
+            Some(_) => Some(upload_linear_for(
+                gpu,
+                file,
+                "joint.enc",
+                "joint.enc",
+                kind,
+            )?),
             None => None,
         };
         if let Some(joint) = &joint
@@ -1152,6 +1194,7 @@ fn load_pre_encode(gpu: &Gpu, file: &Gguf, d: &Dims) -> Result<PreEncode> {
         n: out.rows,
         k: out.cols,
         weight: gpu.upload_f16("pre_encode.out", &reordered),
+        scales: None,
         bias: out
             .bias
             .as_ref()
@@ -1166,19 +1209,20 @@ fn load_pre_encode(gpu: &Gpu, file: &Gguf, d: &Dims) -> Result<PreEncode> {
     })
 }
 
-fn load_block(gpu: &Gpu, file: &Gguf, name: &str, d: &Dims) -> Result<Block> {
+fn load_block(gpu: &Gpu, file: &Gguf, name: &str, d: &Dims, kind: Kind) -> Result<Block> {
     let norm = |n: &str| -> Result<Norm> {
         Ok(Norm {
             weight: gpu.upload_f32(n, &vector(file, &format!("{name}.{n}.weight"))?),
             bias: gpu.upload_f32(n, &vector(file, &format!("{name}.{n}.bias"))?),
         })
     };
-    let linear = |n: &str| upload_linear(gpu, file, &format!("{name}.{n}"), n);
-    let qkv = stacked(
+    let linear = |n: &str| upload_linear_for(gpu, file, &format!("{name}.{n}"), n, kind);
+    let qkv = stacked_for(
         gpu,
         file,
         "attn.qkv",
         &["q", "k", "v"].map(|p| format!("{name}.attn.linear_{p}")),
+        kind,
     )?;
 
     // Batch norm folded into the depthwise convolution: `scale = γ / √(var + ε)`, weights
@@ -1260,9 +1304,80 @@ pub(crate) fn stacked(gpu: &Gpu, file: &Gguf, label: &str, names: &[String]) -> 
         n: bias.len(),
         k: k.unwrap_or(0),
         weight: gpu.upload_f16(label, &weight),
+        scales: None,
         bias: Some(gpu.upload_f32(label, &bias)),
         inexact,
     })
+}
+
+/// [`stacked`] for a multiply of `kind`: as the file's Q8_0 for [`Kind::Q8`] when every
+/// layer is Q8_0.
+pub(crate) fn stacked_for(
+    gpu: &Gpu,
+    file: &Gguf,
+    label: &str,
+    names: &[String],
+    kind: Kind,
+) -> Result<Weights> {
+    if !kind.is_int8() {
+        return stacked(gpu, file, label, names);
+    }
+    let (mut values, mut scales, mut bias) = (Vec::new(), Vec::new(), Vec::new());
+    let mut k = None;
+    for name in names {
+        let Some((rows, cols, v, s)) = gpu::q8::load_weight(file, name)? else {
+            return stacked(gpu, file, label, names);
+        };
+        if *k.get_or_insert(cols) != cols {
+            return Err(Error::Gguf(format!("{label}: layers of different widths")));
+        }
+        values.extend(v);
+        scales.extend(s);
+        match file.tensor(&format!("{name}.bias")) {
+            Some(b) => bias.extend(file.dequantize(b)?),
+            None => bias.extend(std::iter::repeat_n(0., rows)),
+        }
+    }
+    Ok(gpu::q8::upload(
+        gpu,
+        label,
+        (bias.len(), k.unwrap_or(0)),
+        &values,
+        &scales,
+        Some(&bias),
+    ))
+}
+
+/// [`upload_linear`] for a multiply of `kind`: as the file's Q8_0 for [`Kind::Q8`] when it is
+/// Q8_0.
+pub(crate) fn upload_linear_for(
+    gpu: &Gpu,
+    file: &Gguf,
+    name: &str,
+    label: &str,
+    kind: Kind,
+) -> Result<Weights> {
+    if !kind.is_int8() {
+        return upload_linear(gpu, file, name, label);
+    }
+    let Some((rows, cols, values, scales)) = gpu::q8::load_weight(file, name)? else {
+        return upload_linear(gpu, file, name, label);
+    };
+    let bias = match file.tensor(&format!("{name}.bias")) {
+        Some(b) => Some(file.dequantize(b)?),
+        None => None,
+    };
+    if bias.as_ref().is_some_and(|b| b.len() != rows) {
+        return Err(Error::Gguf(format!("{name}.bias: not {rows} values")));
+    }
+    Ok(gpu::q8::upload(
+        gpu,
+        label,
+        (rows, cols),
+        &values,
+        &scales,
+        bias.as_deref(),
+    ))
 }
 
 /// A linear layer `name` (its `.weight` and any `.bias`) uploaded for [`Gemm`].
@@ -1272,6 +1387,7 @@ pub(crate) fn upload_linear(gpu: &Gpu, file: &Gguf, name: &str, label: &str) -> 
         n: layer.rows,
         k: layer.cols,
         weight: gpu.upload_f16(label, &layer.weight),
+        scales: None,
         bias: layer.bias.map(|b| gpu.upload_f32(label, &b)),
         inexact: layer.inexact,
     })
