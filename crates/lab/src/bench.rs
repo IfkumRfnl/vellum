@@ -16,7 +16,7 @@ use crate::{
 use anyhow::Result;
 use serde::Serialize;
 use std::{collections::BTreeMap, time::Duration};
-use vellum_harness::Windowing;
+use vellum_harness::{DeviceRequest, Windowing};
 
 pub struct Args {
     pub tier: Tier,
@@ -166,7 +166,9 @@ pub fn bench(args: &Args) -> Result<bool> {
                     1,
                     1,
                 )?;
-                let outcome = run::run(&programs[i], &job, true)?;
+                // The GPU is watched only when it does the work: a CPU job leaves it idle, at
+                // whatever clock it idles at, which says nothing about the run.
+                let outcome = run::run(&programs[i], &job, candidate.device != DeviceRequest::Cpu)?;
                 let r = &outcome.report;
                 runs.push(JobRun {
                     side,
