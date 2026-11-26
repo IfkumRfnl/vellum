@@ -1,0 +1,3 @@
+[alias]
+# The engine lab: `cargo lab check`, `cargo lab bench`, … (crates/lab/README.md).
+lab = "run --quiet --profile lab -p vellum-lab --"

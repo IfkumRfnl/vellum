@@ -46,8 +46,20 @@ transcribe-cpp = { version = "=0.4.2", default-features = false }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+[workspace]
+# The engine lab (`cargo lab`, crates/lab/README.md). Plain `cargo build` and `cargo test` stay
+# on the app.
+members = ["crates/engine", "crates/harness", "crates/lab", "crates/reference"]
+default-members = ["."]
+
 [profile.dev]
 debug = 0
+
+# The lab's build: release speed, rebuilt incrementally so the engine loop stays fast.
+[profile.lab]
+inherits = "release"
+incremental = true
+codegen-units = 16
 
 # Rune patches these crates in its own workspace. Cargo applies patches only from the root
 # manifest, so an app that depends on Rune repeats them here at the same revision.

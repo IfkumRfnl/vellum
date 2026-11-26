@@ -1,0 +1,25 @@
+[package]
+name = "vellum-ref"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+description = "transcribe.cpp behind the engine lab's job protocol: the engine Vellum's own is measured against"
+license = "MIT"
+publish = false
+
+# The lab builds this on its own, in target/reference, with GGML_NATIVE and transcribe.cpp's
+# validation hooks (see crates/lab/src/reference.rs). It is not one of the default members.
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+vellum-harness = { path = "../harness" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["metal", "serde"] }
+
+[target.'cfg(all(not(target_os = "macos"), not(all(windows, target_arch = "aarch64"))))'.dependencies]
+transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["vulkan", "serde"] }
+
+[target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
+transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["serde"] }
