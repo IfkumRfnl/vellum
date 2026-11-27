@@ -37,3 +37,12 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+      # The speech engine, its harness and the lab (crates/lab/README.md). The reference
+      # adapter builds transcribe.cpp from C++, so it stays out: the lab builds it on demand.
+      - name: Lint the engine and the lab
+        run: cargo clippy --locked --workspace --exclude vellum-reference --all-targets -- -D warnings
+      # The engine's SIMD is x86 only; ARM (macOS, Windows on ARM) takes the portable code.
+      - name: Lint the engine for ARM
+        run: |
+          rustup target add aarch64-apple-darwin
+          cargo clippy --locked -p vellum-engine -p vellum-harness --target aarch64-apple-darwin -- -D warnings

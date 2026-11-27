@@ -518,6 +518,8 @@ fn quantize_row(x: &[f32], quants: &mut [i8], scales: &mut [f32], offsets: &mut 
 struct Inputs<'a, const M: usize> {
     quants: [&'a [i8]; M],
     scales: [&'a [f32]; M],
+    // The x86 kernels' correction for their unsigned weights.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     offsets: [&'a [i32]; M],
 }
 
@@ -666,6 +668,7 @@ pub fn to_f16(x: &Mat) -> Mat {
 /// fused multiply-add per element, rounded to f16 as it's stored.
 pub fn mad_f16(y: &mut [f32], x: &[f32], v: f32) {
     assert_eq!(y.len(), x.len());
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut done = 0;
     #[cfg(target_arch = "x86_64")]
     if kernel() != Kernel::Portable {
@@ -682,6 +685,7 @@ pub fn scale_f16(y: &mut [f32], v: f32) {
     for y in y.iter_mut() {
         *y *= v;
     }
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut done = 0;
     #[cfg(target_arch = "x86_64")]
     if kernel() != Kernel::Portable {

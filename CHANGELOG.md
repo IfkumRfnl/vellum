@@ -18,7 +18,16 @@ Speech and speaker labels now run on Vellum's own engine, written in Rust: Parak
 
 Shorter videos gain too. A 6-minute BBC episode transcribes at 726–743× real time with Parakeet (146× before) and 134–149× with Whisper Large v3 Turbo (66–68× before), with the same speaker accuracy (92.0% and 95.4%); a 3½-minute TED talk at 632× with Parakeet (152×), 240× with Whisper Small (68×) and 145× with Turbo (60×). Word error rates are the same throughout, but for one word in the BBC episode with Parakeet (5.6% against 5.5%).
 
-The words are transcribe.cpp's. In the engine lab, on a broad sample of read speech, meetings, calls, talks and edge cases, Parakeet gives its exact transcript on 524 of 527 recordings with the same word error rate (2.97%), Whisper Small on 570 and Turbo on 589 of 612. Where the Whisper port differs, the lab traced each case to a near-tie (two words, or two languages, the model rates almost equally) or to a window that falls back to random sampling, which transcribe.cpp seeds differently on every run. Speaker turns match within transcribe.cpp's own spread between its CPU and GPU (DER 22.29% against 22.34%, 94.26% of words to the right speaker either way). Paired against it on the same laptop, the median recording is 3.2× faster with Parakeet, 3.6× for speakers, 1.9× with Whisper Small and 1.45× with Turbo (on recordings of several minutes, Turbo is sometimes slower).
+The words are transcribe.cpp's. In the engine lab, on a broad sample of read speech, meetings, calls, talks and edge cases, Parakeet gives its exact transcript on 521 of 527 recordings with the same word error rate, Whisper Small on 570 and Turbo on 589 of 612. Where the Whisper port differs, the lab traced each case to a near-tie (two words, or two languages, the model rates almost equally) or to a window that falls back to random sampling, which transcribe.cpp seeds differently on every run. Speaker turns match within transcribe.cpp's own spread between its CPU and GPU (DER 22.29% against 22.34%, 94.26% of words to the right speaker either way). Paired against it on the same laptop, the median recording is faster everywhere:
+
+| Median recording, against transcribe.cpp | GPU (RTX 4060 laptop) | CPU (Core i5-13450HX) |
+| --- | --- | --- |
+| Parakeet | **4.0×** | **2.6×** |
+| Speaker labels | **3.6×** | **2.3×** |
+| Whisper Small | **2.45×** | 1.07× (level on long recordings) |
+| Whisper Large v3 Turbo | **1.7×** | **2.3×** |
+
+On the GPU, every recording in the speed set is faster than transcribe.cpp. Parakeet's GPU encoder runs on int8 tensor cores, and the CPU uses AVX-VNNI where the processor has it.
 
 ### Changed
 

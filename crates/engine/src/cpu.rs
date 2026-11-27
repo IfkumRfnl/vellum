@@ -301,6 +301,7 @@ pub fn fma_into(y: &mut [f32], w: &[f32], x: &[f32]) {
 pub fn fma_columns(acc: &mut [f32], rows: &[f32], weights: &[f32]) {
     let width = acc.len();
     assert_eq!(rows.len(), width * weights.len());
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut done = 0;
     #[cfg(target_arch = "x86_64")]
     if simd::available() {
@@ -319,7 +320,9 @@ pub fn fma_columns(acc: &mut [f32], rows: &[f32], weights: &[f32]) {
 /// time (the library's for a last few), returning their sum, accumulated in f64 eight by eight
 /// as it does.
 pub fn softmax_like_ggml(x: &mut [f32], max: f32) -> f64 {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut sum = 0f64;
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut done = 0;
     #[cfg(target_arch = "x86_64")]
     if simd::available() {
@@ -356,6 +359,7 @@ pub fn softmax_rows(x: &mut Mat) {
             row.fill(0.);
             return;
         }
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut sum = 0f64;
         for v in row.iter_mut() {
             *v = (*v - max).exp();
@@ -385,6 +389,7 @@ pub fn silu(v: f32) -> f32 {
 /// at a time, and the library's `expf` for the row's last few. Without AVX2 every value takes
 /// the scalar form.
 pub fn silu_like_ggml(row: &mut [f32]) {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut done = 0;
     #[cfg(target_arch = "x86_64")]
     if simd::available() {
@@ -669,6 +674,7 @@ mod simd {
     /// `(hi + lo)`, then pairs, then the last two. Returns how many it did and their sum.
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_like_ggml(x: &mut [f32], max: f32) -> (usize, f64) {
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut sum = 0f64;
         let mut i = 0;
         let m = _mm256_set1_ps(max);
