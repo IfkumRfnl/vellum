@@ -2,7 +2,7 @@
 
 Every release of Vellum. Downloads are on the [releases page](https://github.com/IfkumRfnl/vellum/releases).
 
-## [Unreleased]
+## [0.3.0] — 2026-11-27
 
 ### Vellum's own speech engine
 
@@ -86,6 +86,6 @@ The first release.
 - **Reading progress.** A hairline along the top fills as you read, and the toolbar shows how far you are and the time left at your reading pace.
 - **Made for reading.** One continuous page; serif, sans or mono; adjustable size, width and spacing; timestamps open the video at that moment.
 
-[Unreleased]: https://github.com/IfkumRfnl/vellum/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/IfkumRfnl/vellum/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/IfkumRfnl/vellum/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/IfkumRfnl/vellum/releases/tag/v0.1.0
