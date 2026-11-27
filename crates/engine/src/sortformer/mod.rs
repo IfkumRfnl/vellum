@@ -152,7 +152,8 @@ impl Sortformer {
             }
             None => {
                 let (encoder, transformer) = rayon::join(
-                    || Encoder::load(file, &hparams.encoder),
+                    // The stream's conformer keeps keys and values in f32 (`kv_type`).
+                    || Encoder::load_keys(file, &hparams.encoder, false),
                     || Transformer::load(file, hparams.tf_layers, hparams.tf_heads),
                 );
                 Backend::Cpu {

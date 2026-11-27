@@ -26,7 +26,14 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Parakeet's encoder: the reference keeps its attention's keys and values in f16.
     pub fn load(file: &Gguf, hparams: &HParams) -> Result<Encoder> {
+        Encoder::load_keys(file, hparams, true)
+    }
+
+    /// The encoder with its attention's keys and values in f16 (`kv_f16`, Parakeet's) or f32
+    /// (streaming Sortformer's), as the reference's flash attention takes them on the int8 path.
+    pub fn load_keys(file: &Gguf, hparams: &HParams, kv_f16: bool) -> Result<Encoder> {
         if hparams.subsampling_factor != 8 {
             return Err(Error::Unsupported(format!(
                 "Parakeet with {}× subsampling",
@@ -47,7 +54,7 @@ impl Encoder {
             ));
         }
         let blocks = (0..hparams.n_layers)
-            .map(|l| Block::load(file, &format!("enc.blocks.{l}"), hparams))
+            .map(|l| Block::load(file, &format!("enc.blocks.{l}"), hparams, kv_f16))
             .collect::<Result<_>>()?;
         Ok(Encoder {
             d_model: hparams.d_model,

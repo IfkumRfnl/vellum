@@ -7,7 +7,7 @@
 
 use crate::{
     Error, Result,
-    cpu::{Mat, dot, layer_norm, relu, sigmoid, vector},
+    cpu::{Mat, Rows, axpy, layer_norm, products, relu, sigmoid, vector},
     gguf::Gguf,
     parakeet::encoder::rounding::Layer,
 };
@@ -148,11 +148,9 @@ impl Block {
                     let qi = &q[(h * frames + i) * dh..][..dh];
                     let keys = &k[h * frames * dh..][..frames * dh];
                     let values = &v[h * frames * dh..][..frames * dh];
-                    let mut max = f32::NEG_INFINITY;
-                    for (s, key) in scores.iter_mut().zip(keys.chunks_exact(dh)) {
-                        *s = dot(qi, key);
-                        max = max.max(*s);
-                    }
+                    // Each score exactly `dot(q_i, k_j)`, tiled.
+                    products(&[qi], Rows::F32(keys), dh, scores);
+                    let max = scores.iter().fold(f32::NEG_INFINITY, |m, &s| m.max(s));
                     let mut sum = 0f64;
                     for s in scores.iter_mut() {
                         *s = (*s - max).exp();
@@ -161,10 +159,7 @@ impl Block {
                     let inv_sum = (1. / sum) as f32;
                     let o = &mut out[h * dh..][..dh];
                     for (s, value) in scores.iter().zip(values.chunks_exact(dh)) {
-                        let a = s * inv_sum;
-                        for (o, v) in o.iter_mut().zip(value) {
-                            *o = a.mul_add(*v, *o);
-                        }
+                        axpy(o, s * inv_sum, value);
                     }
                 }
             },

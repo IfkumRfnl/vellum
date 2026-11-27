@@ -8,10 +8,10 @@
 //! convolutions vectorize over channels and the pointwise ones are row-by-row matrix products.
 
 use super::super::HParams;
-use super::rounding::{Layer, ggml_rounding, to_f16};
+use super::rounding::{Layer, rounds_like_ggml, to_f16};
 use crate::{
     Error, Result,
-    cpu::{Mat, dot, relu, vector},
+    cpu::{Mat, Rows, axpy, fma_into, products, relu, vector},
     gguf::Gguf,
 };
 use rayon::prelude::*;
@@ -61,6 +61,13 @@ impl Subsampling {
                     w.len()
                 )));
             }
+            // ggml rounds the kernel to f16 with its im2col; so do products that round
+            // like it, once here.
+            let w = if rounds_like_ggml() {
+                to_f16(&Mat::from_vec(c, c, w)).data
+            } else {
+                w
+            };
             Ok((w, vector(file, &format!("{p}.{name}.bias"))?))
         };
         Ok(Subsampling {
@@ -90,9 +97,8 @@ impl Subsampling {
         x.data.map(relu);
         for ((dw, dw_bias), (pw, pw_bias)) in self.depthwise.iter().zip(&self.pointwise) {
             x = conv3x3_stride2(&x, dw, dw_bias);
-            x.data = if ggml_rounding() {
-                let pw = to_f16(&Mat::from_vec(c, c, pw.clone()));
-                pointwise_conv(&to_f16(&x.data), &pw.data, pw_bias)
+            x.data = if rounds_like_ggml() {
+                pointwise_conv(&to_f16(&x.data), pw, pw_bias)
             } else {
                 pointwise_conv(&x.data, pw, pw_bias)
             };
@@ -142,14 +148,9 @@ fn conv3x3_stride2(x: &Grid, weights: &[f32], bias: &[f32]) -> Grid {
                         let w = &weights[(dt * 3 + df) * channels..][..channels];
                         let point = x.data.row(ti * x.freq + fi);
                         if single_input {
-                            let v = point[0];
-                            for (y, w) in y.iter_mut().zip(w) {
-                                *y = w.mul_add(v, *y);
-                            }
+                            axpy(y, point[0], w);
                         } else {
-                            for ((y, w), v) in y.iter_mut().zip(w).zip(point) {
-                                *y = w.mul_add(*v, *y);
-                            }
+                            fma_into(y, w, point);
                         }
                     }
                 }
@@ -162,7 +163,9 @@ fn conv3x3_stride2(x: &Grid, weights: &[f32], bias: &[f32]) -> Grid {
     }
 }
 
-/// A 1×1 convolution: every point's channels through an `[out][in]` matrix, plus bias.
+/// A 1×1 convolution: every point's channels through an `[out][in]` matrix, plus bias. Each
+/// output is exactly [`dot`](crate::cpu::dot) of its point and the weight row ([`products`]
+/// tiles the work, not the sums).
 fn pointwise_conv(x: &Mat, weight: &[f32], bias: &[f32]) -> Mat {
     let channels = bias.len();
     let mut out = Mat::zeros(x.rows, channels);
@@ -170,9 +173,11 @@ fn pointwise_conv(x: &Mat, weight: &[f32], bias: &[f32]) -> Mat {
         .par_chunks_mut(channels * 64)
         .zip(x.data.par_chunks(x.cols * 64))
         .for_each(|(ys, xs)| {
-            for (y, x) in ys.chunks_exact_mut(channels).zip(xs.chunks_exact(x.cols)) {
-                for (o, y) in y.iter_mut().enumerate() {
-                    *y = dot(&weight[o * x.len()..][..x.len()], x) + bias[o];
+            let points: Vec<&[f32]> = xs.chunks_exact(x.cols).collect();
+            products(&points, Rows::F32(weight), x.cols, ys);
+            for y in ys.chunks_exact_mut(channels) {
+                for (y, b) in y.iter_mut().zip(bias) {
+                    *y += b;
                 }
             }
         });

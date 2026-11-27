@@ -345,6 +345,39 @@ impl Gguf {
         &self.map[info.offset..info.offset + info.bytes]
     }
 
+    /// Tells the operating system this process is done reading a tensor's bytes for now, so
+    /// their pages leave its working set: a model that converts its weights at load then never
+    /// holds the file and its own copy in memory at once. Reading the tensor again later just
+    /// maps its pages back in from the file.
+    pub fn release(&self, info: &TensorInfo) {
+        let bytes = &self.map[info.offset..info.offset + info.bytes];
+        if bytes.is_empty() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn VirtualUnlock(address: *const std::ffi::c_void, size: usize) -> i32;
+            }
+            // SAFETY: the range is inside the mapping. On pages that aren't locked this only
+            // removes them from the working set (documented); its "not locked" failure is that.
+            unsafe { VirtualUnlock(bytes.as_ptr().cast(), bytes.len()) };
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: the mapping is private and read-only: dropped pages are read from the
+            // file again if anything touches them.
+            let _ = unsafe {
+                self.map.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    info.offset,
+                    info.bytes,
+                )
+            };
+        }
+    }
+
     /// A tensor as f32, for the types the engine reads on the CPU: F32, F16, BF16 and Q8_0.
     pub fn dequantize(&self, info: &TensorInfo) -> Result<Vec<f32>> {
         let data = self.data(info);

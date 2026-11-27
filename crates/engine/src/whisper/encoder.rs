@@ -4,14 +4,20 @@
 //! final layer norm. Checkpoints: `enc.mel.in` (taken by the caller), `enc.conv1.out`,
 //! `enc.conv2.out`, `enc.pos_emb`, `enc.embed.out`, `enc.block.<L>.out`, `enc.final`.
 //!
-//! Matrix products are exact f32 against the exactly dequantized weights (the reference
-//! rounds each Q8_0 layer's input to 8 bits first). Its flash attention on f32 keys and values
-//! is an online softmax of the same scores; this takes it in one pass.
+//! Matrix products are, for Large v3 (Turbo), the CPU's int8 products: each Q8_0 layer's input
+//! rounded to 8 bits as the reference rounds it, and GELU as ggml computes it; for the other
+//! sizes exact f32 against the exactly dequantized weights (see [`Encoder::load`]). The convolutions' kernels are f32 in the file and
+//! stay exact, as the reference keeps them (`conv_1d_f32`). Its flash attention on f32 keys and
+//! values is an online softmax of the same scores; this takes it in one pass.
 
 use super::{HParams, ops::Norm, ops::linear};
 use crate::{
     Result, Trace,
-    cpu::{Linear, Mat, Rows, Weight, gelu, products, tensor, vector},
+    cpu::{
+        Linear, Mat, Rows, Weight,
+        int8::{Dense, int8_unless_told},
+        products, tensor, vector,
+    },
     gguf::Gguf,
     trace::checkpoint,
 };
@@ -24,8 +30,10 @@ pub struct Encoder {
     heads: usize,
     /// The convolutions as linear layers over each output frame's three input frames
     /// (`[channel][tap]`, the reference's im2col order).
-    conv1: Linear,
-    conv2: Linear,
+    conv1: Dense,
+    conv2: Dense,
+    /// Whether the products are the int8 ones (and GELU as ggml computes it).
+    int8: bool,
     positions: Mat,
     blocks: Vec<Block>,
     final_norm: Norm,
@@ -33,30 +41,34 @@ pub struct Encoder {
 
 struct Block {
     norm_attn: Norm,
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    out: Linear,
+    q: Dense,
+    k: Dense,
+    v: Dense,
+    out: Dense,
     norm_ffn: Norm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: Dense,
+    fc2: Dense,
 }
 
 impl Encoder {
+    /// The encoder; its products are the int8 ones where that was measured to keep the
+    /// transcripts within the lab's gates against the reference (Large v3 Turbo; Small lost
+    /// WER under every int8 variant tried), unless `VELLUM_CPU_GEMM` says otherwise.
     pub fn load(file: &Gguf, hp: &HParams) -> Result<Encoder> {
+        let int8 = int8_unless_told(hp.d_model == 1280 && hp.enc_layers == 32);
         let blocks = (0..hp.enc_layers)
             .into_par_iter()
             .map(|l| {
                 let name = |part: &str| format!("enc.blocks.{l}.{part}");
                 Ok(Block {
                     norm_attn: Norm::load(file, &name("norm_attn"))?,
-                    q: Linear::load(file, &name("attn.q"))?,
-                    k: Linear::load(file, &name("attn.k"))?,
-                    v: Linear::load(file, &name("attn.v"))?,
-                    out: Linear::load(file, &name("attn.out"))?,
+                    q: Dense::load_as(file, &name("attn.q"), int8)?,
+                    k: Dense::load_as(file, &name("attn.k"), int8)?,
+                    v: Dense::load_as(file, &name("attn.v"), int8)?,
+                    out: Dense::load_as(file, &name("attn.out"), int8)?,
                     norm_ffn: Norm::load(file, &name("norm_ffn"))?,
-                    fc1: Linear::load(file, &name("ffn.fc1"))?,
-                    fc2: Linear::load(file, &name("ffn.fc2"))?,
+                    fc1: Dense::load_as(file, &name("ffn.fc1"), int8)?,
+                    fc2: Dense::load_as(file, &name("ffn.fc2"), int8)?,
                 })
             })
             .collect::<Result<_>>()?;
@@ -64,8 +76,9 @@ impl Encoder {
         let rows = pos.dims[1] as usize;
         Ok(Encoder {
             heads: hp.enc_heads,
-            conv1: conv(file, "enc.conv.0")?,
-            conv2: conv(file, "enc.conv.1")?,
+            conv1: Dense::Exact(conv(file, "enc.conv.0")?),
+            conv2: Dense::Exact(conv(file, "enc.conv.1")?),
+            int8,
             positions: Mat::from_vec(rows, hp.d_model, file.dequantize(pos)?),
             blocks,
             final_norm: Norm::load(file, "enc.final_norm")?,
@@ -76,10 +89,10 @@ impl Encoder {
     /// (frames / 2 × `d_model`).
     pub fn forward(&self, mel: &Mat, trace: &mut dyn Trace) -> Mat {
         let mut x = linear(&self.conv1, &im2col(mel, 1));
-        x.map(gelu);
+        super::ops::gelu_rows(&mut x, self.int8);
         checkpoint(trace, "enc.conv1.out", &mut x);
         let mut x = linear(&self.conv2, &im2col(&x, 2));
-        x.map(gelu);
+        super::ops::gelu_rows(&mut x, self.int8);
         checkpoint(trace, "enc.conv2.out", &mut x);
         let mut pos = Mat::from_vec(
             x.rows,
@@ -99,7 +112,7 @@ impl Encoder {
             );
             x.add_assign(&linear(&block.out, &attended));
             let mut h = linear(&block.fc1, &block.norm_ffn.apply(&x));
-            h.map(gelu);
+            super::ops::gelu_rows(&mut h, self.int8);
             x.add_assign(&linear(&block.fc2, &h));
             checkpoint(trace, &format!("enc.block.{l}.out"), &mut x);
         }
@@ -148,7 +161,8 @@ fn im2col(x: &Mat, stride: usize) -> Mat {
     out
 }
 
-/// Bidirectional multi-head attention of every frame over every frame.
+/// Bidirectional multi-head attention of every frame over every frame, in one pass. (On the
+/// int8 path too: emulating the reference's tiled flash attention measured no closer to it.)
 fn self_attention(q: &Mat, k: &Mat, v: &Mat, heads: usize) -> Mat {
     let (frames, d) = (q.rows, q.cols);
     let hd = d / heads;

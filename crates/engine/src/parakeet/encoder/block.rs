@@ -4,10 +4,10 @@
 
 use super::super::HParams;
 use super::attention::SelfAttention;
-use super::rounding::Layer;
+use super::rounding::{Layer, rounds_like_ggml};
 use crate::{
     Error, Result, Trace,
-    cpu::{Mat, layer_norm, sigmoid, silu, vector},
+    cpu::{Mat, fma_into, layer_norm, sigmoid, silu, silu_like_ggml, vector},
     gguf::Gguf,
     trace::checkpoint,
 };
@@ -29,12 +29,12 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn load(file: &Gguf, name: &str, hparams: &HParams) -> Result<Block> {
+    pub fn load(file: &Gguf, name: &str, hparams: &HParams, kv_f16: bool) -> Result<Block> {
         Ok(Block {
             norm_ff1: Norm::load(file, &format!("{name}.norm_ff1"))?,
             ff1: FeedForward::load(file, &format!("{name}.ff1"))?,
             norm_attn: Norm::load(file, &format!("{name}.norm_attn"))?,
-            attn: SelfAttention::load(file, &format!("{name}.attn"), hparams.n_heads)?,
+            attn: SelfAttention::load(file, &format!("{name}.attn"), hparams.n_heads, kv_f16)?,
             norm_conv: Norm::load(file, &format!("{name}.norm_conv"))?,
             conv: ConvModule::load(file, &format!("{name}.conv"), hparams.conv_kernel)?,
             norm_ff2: Norm::load(file, &format!("{name}.norm_ff2"))?,
@@ -95,7 +95,7 @@ impl FeedForward {
 
     fn forward(&self, x: &Mat) -> Mat {
         let mut h = self.linear1.forward(x);
-        h.map(silu);
+        swish(&mut h.data, h.cols);
         self.linear2.forward(&h)
     }
 }
@@ -181,15 +181,31 @@ impl ConvModule {
                     let Some(ti) = (t + k).checked_sub(pad).filter(|&ti| ti < glu.rows) else {
                         continue;
                     };
-                    let w = &self.depthwise[k * channels..][..channels];
-                    for ((y, w), v) in y.iter_mut().zip(w).zip(glu.row(ti)) {
-                        *y = w.mul_add(*v, *y);
-                    }
+                    fma_into(y, &self.depthwise[k * channels..][..channels], glu.row(ti));
                 }
                 for ((y, s), b) in y.iter_mut().zip(&self.bn_scale).zip(&self.bn_shift) {
-                    *y = silu(*y * s + b);
+                    *y = *y * s + b;
                 }
+                swish_row(y);
             });
         self.pointwise2.forward(&conv)
+    }
+}
+
+/// SiLU over rows of `width` values in place: as ggml computes it when the products round like
+/// ggml's (the int8 path), else `x · σ(x)` exactly.
+fn swish(x: &mut [f32], width: usize) {
+    if width == 0 {
+        return;
+    }
+    x.par_chunks_mut(width).for_each(swish_row);
+}
+
+/// [`swish`] on one row.
+fn swish_row(row: &mut [f32]) {
+    if rounds_like_ggml() {
+        silu_like_ggml(row);
+    } else {
+        row.iter_mut().for_each(|v| *v = silu(*v));
     }
 }

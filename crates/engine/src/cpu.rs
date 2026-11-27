@@ -12,6 +12,9 @@ use crate::{
 };
 use rayon::prelude::*;
 
+pub mod flash;
+pub mod int8;
+
 /// A row-major matrix: `rows` vectors of `cols` values (time steps × features, usually).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mat {
@@ -260,6 +263,76 @@ fn portable_dot(a: &[f32], b: &[f32]) -> f32 {
     ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
 }
 
+/// `y[k] = a · x[k] + y[k]`, each element one fused multiply-add (exactly `a.mul_add(x[k], y[k])`),
+/// eight at a time with AVX2 and FMA (detected at run time; `mul_add` is a library call per
+/// element otherwise).
+pub fn axpy(y: &mut [f32], a: f32, x: &[f32]) {
+    assert_eq!(y.len(), x.len());
+    #[cfg(target_arch = "x86_64")]
+    if simd::available() {
+        // SAFETY: the CPU has the features, and the slices are the same length.
+        unsafe { simd::axpy(y, a, x) };
+        return;
+    }
+    for (y, x) in y.iter_mut().zip(x) {
+        *y = a.mul_add(*x, *y);
+    }
+}
+
+/// `y[k] = w[k] · x[k] + y[k]`, each element one fused multiply-add (exactly
+/// `w[k].mul_add(x[k], y[k])`), as [`axpy`] computes its.
+pub fn fma_into(y: &mut [f32], w: &[f32], x: &[f32]) {
+    assert!(y.len() == x.len() && y.len() == w.len());
+    #[cfg(target_arch = "x86_64")]
+    if simd::available() {
+        // SAFETY: the CPU has the features, and the slices are the same length.
+        unsafe { simd::fma_into(y, w, x) };
+        return;
+    }
+    for ((y, w), x) in y.iter_mut().zip(w).zip(x) {
+        *y = w.mul_add(*x, *y);
+    }
+}
+
+/// `acc[c] += Σ_r rows[r][c] · weights[r]` for each of the `acc.len()` columns of `rows` (one
+/// row per weight, `acc.len()` values each), each column one fused multiply-add per row in row
+/// order: how ggml's `simd_gemm` accumulates a matrix product (its flash attention's scores and
+/// value sums). Eight columns at a time with AVX2 and FMA.
+pub fn fma_columns(acc: &mut [f32], rows: &[f32], weights: &[f32]) {
+    let width = acc.len();
+    assert_eq!(rows.len(), width * weights.len());
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if simd::available() {
+        // SAFETY: the CPU has the features, and the lengths were checked.
+        done = unsafe { simd::fma_columns(acc, rows, weights) };
+    }
+    for (r, w) in weights.iter().enumerate() {
+        let row = &rows[r * width..][..width];
+        for c in done..width {
+            acc[c] = row[c].mul_add(*w, acc[c]);
+        }
+    }
+}
+
+/// ggml's `ggml_vec_soft_max_f32`: `x[i] = e^(x[i] − max)` with its vector `expf` eight at a
+/// time (the library's for a last few), returning their sum, accumulated in f64 eight by eight
+/// as it does.
+pub fn softmax_like_ggml(x: &mut [f32], max: f32) -> f64 {
+    let mut sum = 0f64;
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if simd::available() {
+        // SAFETY: the CPU has the features.
+        (done, sum) = unsafe { simd::softmax_like_ggml(x, max) };
+    }
+    for v in &mut x[done..] {
+        *v = (*v - max).exp();
+        sum += *v as f64;
+    }
+    sum
+}
+
 /// Layer normalization over each row, with learned scale and shift.
 pub fn layer_norm(x: &Mat, weight: &[f32], bias: &[f32], eps: f32) -> Mat {
     let mut out = x.clone();
@@ -307,9 +380,35 @@ pub fn silu(v: f32) -> f32 {
     v * sigmoid(v)
 }
 
+/// SiLU over one row in place, as ggml's CPU computes it (`ggml_vec_silu_f32`): `x / (1 + e^−x)`
+/// with its own vector `expf` (`ggml_v_expf`, AVX2 and FMA, detected at run time) eight values
+/// at a time, and the library's `expf` for the row's last few. Without AVX2 every value takes
+/// the scalar form.
+pub fn silu_like_ggml(row: &mut [f32]) {
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if simd::available() {
+        // SAFETY: the CPU has the features.
+        done = unsafe { simd::silu_like_ggml(row) };
+    }
+    for v in &mut row[done..] {
+        *v /= 1. + (-*v).exp();
+    }
+}
+
 /// GELU as Whisper uses it (the exact, erf-based form).
 pub fn gelu(v: f32) -> f32 {
     0.5 * v * (1. + erf(v / std::f32::consts::SQRT_2))
+}
+
+/// GELU as ggml's CPU computes `ggml_gelu_erf` (`ggml_vec_gelu_erf_f32`):
+/// `0.5 · x · (1 + erff(x · (1/√2)))` in f32, with the C library's `erff`, the function the
+/// reference calls.
+pub fn gelu_like_ggml(v: f32) -> f32 {
+    unsafe extern "C" {
+        safe fn erff(x: f32) -> f32;
+    }
+    0.5 * v * (1. + erff(v * std::f32::consts::FRAC_1_SQRT_2))
 }
 
 /// The error function, to about 1e-7 (Abramowitz–Stegun 7.1.26 is too coarse for parity, so
@@ -459,6 +558,184 @@ mod simd {
         // SAFETY: the 8 bytes read are `bytes`.
         let q = unsafe { _mm_loadl_epi64(bytes.as_ptr().cast()) };
         _mm256_mul_ps(scale, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q)))
+    }
+
+    /// ggml's `ggml_v_expf` (AVX2 and FMA): e^x to about 1.5 ulp, with its handling of large
+    /// magnitudes, instruction for instruction.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    fn ggml_expf(x: __m256) -> __m256 {
+        let c = |bits: u32| _mm256_set1_ps(f32::from_bits(bits));
+        let r = c(0x4b40_0000);
+        let z = _mm256_fmadd_ps(x, c(0x3fb8_aa3b), r);
+        let n = _mm256_sub_ps(z, r);
+        let b = _mm256_fnmadd_ps(n, c(0x35bf_be8e), _mm256_fnmadd_ps(n, c(0x3f31_7200), x));
+        let e = _mm256_slli_epi32::<23>(_mm256_castps_si256(z));
+        let k = _mm256_castsi256_ps(_mm256_add_epi32(e, _mm256_castps_si256(_mm256_set1_ps(1.))));
+        let abs_n = _mm256_andnot_ps(_mm256_set1_ps(-0.), n);
+        let big = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_GT_OQ>(abs_n, _mm256_set1_ps(126.)));
+        let u = _mm256_mul_ps(b, b);
+        let j = _mm256_fmadd_ps(
+            _mm256_fmadd_ps(
+                _mm256_fmadd_ps(c(0x3c07_2010), b, c(0x3d2b_9f17)),
+                u,
+                _mm256_fmadd_ps(c(0x3e2a_af33), b, c(0x3eff_fedb)),
+            ),
+            u,
+            _mm256_mul_ps(c(0x3f7f_fff6), b),
+        );
+        if _mm256_movemask_ps(_mm256_castsi256_ps(big)) == 0 {
+            return _mm256_fmadd_ps(j, k, k);
+        }
+        let g = _mm256_and_si256(
+            _mm256_castps_si256(_mm256_cmp_ps::<_CMP_LE_OQ>(n, _mm256_setzero_ps())),
+            _mm256_set1_epi32(0x8200_0000u32 as i32),
+        );
+        let s1 = _mm256_castsi256_ps(_mm256_add_epi32(g, _mm256_set1_epi32(0x7f00_0000)));
+        let s2 = _mm256_castsi256_ps(_mm256_sub_epi32(e, g));
+        let huge = _mm256_cmp_ps::<_CMP_GT_OQ>(abs_n, _mm256_set1_ps(192.));
+        let big = _mm256_castsi256_ps(big);
+        _mm256_or_ps(
+            _mm256_and_ps(huge, _mm256_mul_ps(s1, s1)),
+            _mm256_andnot_ps(
+                huge,
+                _mm256_or_ps(
+                    _mm256_and_ps(big, _mm256_mul_ps(_mm256_fmadd_ps(s2, j, s2), s1)),
+                    _mm256_andnot_ps(big, _mm256_fmadd_ps(k, j, k)),
+                ),
+            ),
+        )
+    }
+
+    /// [`super::silu_like_ggml`]'s vector part: `x / (1 + e^−x)` for each whole eight of `row`,
+    /// as ggml's `ggml_v_silu`; returns how many values it did.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn silu_like_ggml(row: &mut [f32]) -> usize {
+        let mut i = 0;
+        while i + 8 <= row.len() {
+            // SAFETY: values `i..i + 8` are inside the row.
+            unsafe {
+                let x = _mm256_loadu_ps(row.as_ptr().add(i));
+                let e = ggml_expf(_mm256_sub_ps(_mm256_setzero_ps(), x));
+                let y = _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.), e));
+                _mm256_storeu_ps(row.as_mut_ptr().add(i), y);
+            }
+            i += 8;
+        }
+        i
+    }
+
+    /// [`super::fma_columns`]'s vector part: columns 64 (then 8) at a time, the sums kept in
+    /// registers across the rows; returns how many columns it did.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn fma_columns(acc: &mut [f32], rows: &[f32], weights: &[f32]) -> usize {
+        let width = acc.len();
+        let mut c0 = 0;
+        while c0 + 64 <= width {
+            let mut a = [_mm256_setzero_ps(); 8];
+            for k in 0..8 {
+                // SAFETY: columns `c0..c0 + 64` are inside `acc` and every row.
+                a[k] = unsafe { _mm256_loadu_ps(acc.as_ptr().add(c0 + 8 * k)) };
+            }
+            for (r, w) in weights.iter().enumerate() {
+                let p = _mm256_set1_ps(*w);
+                let row = r * width + c0;
+                for k in 0..8 {
+                    // SAFETY: as above.
+                    let b = unsafe { _mm256_loadu_ps(rows.as_ptr().add(row + 8 * k)) };
+                    a[k] = _mm256_fmadd_ps(b, p, a[k]);
+                }
+            }
+            for k in 0..8 {
+                // SAFETY: as above.
+                unsafe { _mm256_storeu_ps(acc.as_mut_ptr().add(c0 + 8 * k), a[k]) };
+            }
+            c0 += 64;
+        }
+        while c0 + 8 <= width {
+            // SAFETY: columns `c0..c0 + 8` are inside `acc` and every row.
+            let mut a = unsafe { _mm256_loadu_ps(acc.as_ptr().add(c0)) };
+            for (r, w) in weights.iter().enumerate() {
+                let b = unsafe { _mm256_loadu_ps(rows.as_ptr().add(r * width + c0)) };
+                a = _mm256_fmadd_ps(b, _mm256_set1_ps(*w), a);
+            }
+            unsafe { _mm256_storeu_ps(acc.as_mut_ptr().add(c0), a) };
+            c0 += 8;
+        }
+        c0
+    }
+
+    /// [`super::softmax_like_ggml`]'s vector part, as `ggml_vec_soft_max_f32` adds each eight:
+    /// `(hi + lo)`, then pairs, then the last two. Returns how many it did and their sum.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn softmax_like_ggml(x: &mut [f32], max: f32) -> (usize, f64) {
+        let mut sum = 0f64;
+        let mut i = 0;
+        let m = _mm256_set1_ps(max);
+        while i + 8 <= x.len() {
+            // SAFETY: values `i..i + 8` are inside `x`.
+            unsafe {
+                let val = ggml_expf(_mm256_sub_ps(_mm256_loadu_ps(x.as_ptr().add(i)), m));
+                _mm256_storeu_ps(x.as_mut_ptr().add(i), val);
+                let v2 = _mm_add_ps(_mm256_extractf128_ps::<1>(val), _mm256_castps256_ps128(val));
+                let v2 = _mm_add_ps(v2, _mm_movehl_ps(v2, v2));
+                let v2 = _mm_add_ss(v2, _mm_movehdup_ps(v2));
+                sum += _mm_cvtss_f32(v2) as f64;
+            }
+            i += 8;
+        }
+        (i, sum)
+    }
+
+    /// [`super::axpy`].
+    ///
+    /// # Safety
+    /// The slices are the same length.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn axpy(y: &mut [f32], a: f32, x: &[f32]) {
+        let n = y.len();
+        let av = _mm256_set1_ps(a);
+        let mut i = 0;
+        while i + 8 <= n {
+            // SAFETY: elements `i..i + 8` are inside both.
+            unsafe {
+                let r = _mm256_fmadd_ps(
+                    av,
+                    _mm256_loadu_ps(x.as_ptr().add(i)),
+                    _mm256_loadu_ps(y.as_ptr().add(i)),
+                );
+                _mm256_storeu_ps(y.as_mut_ptr().add(i), r);
+            }
+            i += 8;
+        }
+        for k in i..n {
+            y[k] = a.mul_add(x[k], y[k]);
+        }
+    }
+
+    /// [`super::fma_into`].
+    ///
+    /// # Safety
+    /// The slices are the same length.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn fma_into(y: &mut [f32], w: &[f32], x: &[f32]) {
+        let n = y.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            // SAFETY: elements `i..i + 8` are inside all three.
+            unsafe {
+                let r = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(w.as_ptr().add(i)),
+                    _mm256_loadu_ps(x.as_ptr().add(i)),
+                    _mm256_loadu_ps(y.as_ptr().add(i)),
+                );
+                _mm256_storeu_ps(y.as_mut_ptr().add(i), r);
+            }
+            i += 8;
+        }
+        for k in i..n {
+            y[k] = w[k].mul_add(x[k], y[k]);
+        }
     }
 
     /// `M` inputs × `N` f32 weight rows of equal length: each sum in one 8-lane FMA chain.

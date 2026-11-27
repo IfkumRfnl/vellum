@@ -3,7 +3,11 @@
 
 use crate::{
     Result,
-    cpu::{Linear, Mat, Weight, layer_norm, products, vector},
+    cpu::{
+        Linear, Mat, Weight,
+        int8::{Dense, mad_f16, scale_f16},
+        layer_norm, products, vector,
+    },
     gguf::Gguf,
 };
 use half::f16;
@@ -31,23 +35,38 @@ impl Norm {
     }
 }
 
+/// GELU over `x` in place: as ggml computes it on the int8 path, exactly (erf in f64) on the
+/// f32 oracle.
+pub fn gelu_rows(x: &mut Mat, like_ggml: bool) {
+    if like_ggml {
+        x.map(crate::cpu::gelu_like_ggml);
+    } else {
+        x.map(crate::cpu::gelu);
+    }
+}
+
 /// Output rows per task when a layer multiplies only a few input rows.
 const ROWS_PER_TASK: usize = 64;
 
-/// `x · Wᵀ + b`. Many rows go through [`Linear::forward`] (weights expanded per panel, cache
-/// blocked); a few (decoder steps) stream the stored weights once, in tasks of output rows,
-/// with the same sums either way (see [`products`]).
-pub fn linear(layer: &Linear, x: &Mat) -> Mat {
+/// `x · Wᵀ + b`. The int8 products take any number of rows themselves. In f32, many rows go
+/// through [`Linear::forward`] (weights expanded per panel, cache blocked); a few (decoder
+/// steps) stream the stored weights once, in tasks of output rows, with the same sums either
+/// way (see [`products`]).
+pub fn linear(layer: &Dense, x: &Mat) -> Mat {
+    let Dense::Exact(layer) = layer else {
+        return layer.forward(x);
+    };
     if ggml_rounding() && matches!(layer.weight, Weight::Q8(_)) {
         return exact_linear(layer, &to_q8(x));
     }
     exact_linear(layer, x)
 }
 
-/// Whether `VELLUM_GGML_ROUNDING=1` is set: an experiment that rounds each Q8_0 layer's input
-/// to Q8_0 blocks first, as ggml's CPU matmuls do (an f16 scale per 32 values, the values
-/// `round(x / scale)`, ties to even), to show how much of the difference from the reference
-/// is that rounding. Off, every layer multiplies the exact activations.
+/// Whether `VELLUM_GGML_ROUNDING=1` is set: an experiment on the f32 oracle
+/// (`VELLUM_CPU_GEMM=f32`) that rounds each Q8_0 layer's input to Q8_0 blocks first, as ggml's
+/// CPU matmuls do (an f16 scale per 32 values, the values `round(x / scale)`, ties to even),
+/// in plain code: the int8 products' reference. It also turns on the emulation of ggml's CPU
+/// flash attention on f16 keys and values ([`attend`]).
 pub fn ggml_rounding() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VELLUM_GGML_ROUNDING").is_ok_and(|v| v == "1"))
@@ -222,7 +241,8 @@ pub fn attend(
 const GGML_THREADS: usize = 8;
 
 /// [`attend`] on f16 keys and values as ggml's CPU flash attention computes it (the
-/// `VELLUM_GGML_ROUNDING` experiment): one key at a time with a running maximum, the weighted
+/// `VELLUM_GGML_ROUNDING` experiment on the f32 oracle; on the int8 path it measured further
+/// from the reference than the exact attention): one key at a time with a running maximum, the weighted
 /// values summed in an f16 accumulator (rounded after every multiply-add and rescale). A
 /// single query over 512 keys or more is split into one run per thread (over the cache
 /// padded to a multiple of 256, as the reference's cross cache is), joined in f32.
@@ -263,22 +283,19 @@ fn attend_ggml(
                 for start in (0..padded).step_by(chunk) {
                     let end = (start + chunk).min(seen);
                     let (mut m, mut s) = (f32::NEG_INFINITY, 0f32);
-                    let mut acc = vec![f16::ZERO; hd];
+                    // An f16 accumulator, held as the f32 values of its f16s.
+                    let mut acc = vec![0f32; hd];
                     for j in start..end {
                         let score = crate::cpu::dot(&query, &k[j * hd..(j + 1) * hd]) * scale;
                         let (mut ms, mut vs) = (1f32, 1f32);
                         if score > m {
                             ms = (m - score).exp();
                             m = score;
-                            for a in acc.iter_mut() {
-                                *a = f16::from_f32(a.to_f32() * ms);
-                            }
+                            scale_f16(&mut acc, ms);
                         } else {
                             vs = (score - m).exp();
                         }
-                        for (a, &x) in acc.iter_mut().zip(&v[j * hd..(j + 1) * hd]) {
-                            *a = f16::from_f32(x.mul_add(vs, a.to_f32()));
-                        }
+                        mad_f16(&mut acc, &v[j * hd..(j + 1) * hd], vs);
                         s = s * ms + vs;
                     }
                     if s == 0. {
@@ -287,7 +304,7 @@ fn attend_ggml(
                     let m_new = m_all.max(m);
                     let (old, new) = ((m_all - m_new).exp(), (m - m_new).exp());
                     for (a, b) in acc_all.iter_mut().zip(&acc) {
-                        *a = *a * old + b.to_f32() * new;
+                        *a = *a * old + b * new;
                     }
                     s_all = s_all * old + s * new;
                     m_all = m_new;

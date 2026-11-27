@@ -11,7 +11,11 @@ use super::{
 };
 use crate::{
     Result,
-    cpu::{Linear, Mat, Rows, Weight, expand, gelu, products, tensor, weight},
+    cpu::{
+        Mat, Rows, Weight, expand,
+        int8::{Dense, Q8Matrix, int8_unless_told, quantize},
+        products, tensor, weight,
+    },
     gguf::Gguf,
 };
 use rayon::prelude::*;
@@ -24,7 +28,7 @@ pub struct Decoder {
     heads: usize,
     vocab: usize,
     /// The token embedding (vocab × d_model), also the output head.
-    embedding: Weight,
+    embedding: Embedding,
     positions: Mat,
     blocks: Vec<Block>,
     final_norm: Norm,
@@ -32,18 +36,24 @@ pub struct Decoder {
 
 struct Block {
     norm_self: Norm,
-    self_q: Linear,
-    self_k: Linear,
-    self_v: Linear,
-    self_out: Linear,
+    self_q: Dense,
+    self_k: Dense,
+    self_v: Dense,
+    self_out: Dense,
     norm_cross: Norm,
-    cross_q: Linear,
-    cross_k: Linear,
-    cross_v: Linear,
-    cross_out: Linear,
+    cross_q: Dense,
+    cross_k: Dense,
+    cross_v: Dense,
+    cross_out: Dense,
     norm_ffn: Norm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: Dense,
+    fc2: Dense,
+}
+
+/// The token embedding as the int8 products take it, or as the f32 oracle reads it.
+enum Embedding {
+    Exact(Weight),
+    Int8(Q8Matrix),
 }
 
 /// The encoder's keys and values for every decoder layer.
@@ -74,7 +84,13 @@ impl Decoder {
             .into_par_iter()
             .map(|l| {
                 let name = |part: &str| format!("dec.blocks.{l}.{part}");
-                let lin = |part: &str| Linear::load(file, &name(part));
+                let lin = |part: &str| -> Result<Dense> {
+                    if int8_decoder() {
+                        Dense::load(file, &name(part))
+                    } else {
+                        Ok(Dense::Exact(crate::cpu::Linear::load(file, &name(part))?))
+                    }
+                };
                 Ok(Block {
                     norm_self: Norm::load(file, &name("norm_self"))?,
                     self_q: lin("self_attn.q")?,
@@ -92,7 +108,19 @@ impl Decoder {
                 })
             })
             .collect::<Result<_>>()?;
-        let (vocab, d_model, embedding) = weight(file, "dec.token_embd.weight")?;
+        let info = tensor(file, "dec.token_embd.weight")?;
+        let (vocab, d_model, embedding) = match info.dtype {
+            crate::gguf::Dtype::Q8_0 if int8_decoder() && info.dims[0] % 32 == 0 => {
+                let (d, vocab) = (info.dims[0] as usize, info.dims[1] as usize);
+                let matrix = Q8Matrix::from_q8_0(file.data(info), vocab, d);
+                file.release(info);
+                (vocab, d, Embedding::Int8(matrix))
+            }
+            _ => {
+                let (vocab, d, w) = weight(file, "dec.token_embd.weight")?;
+                (vocab, d, Embedding::Exact(w))
+            }
+        };
         let pos = tensor(file, "dec.pos_emb.weight")?;
         Ok(Decoder {
             d_model,
@@ -188,7 +216,7 @@ impl Decoder {
             x.add_assign(&linear(&block.cross_out, &attended));
 
             let mut h = linear(&block.fc1, &block.norm_ffn.apply(&x));
-            h.map(gelu);
+            super::ops::gelu_rows(&mut h, int8_decoder());
             x.add_assign(&linear(&block.fc2, &h));
             if let Some(t) = taps.as_deref_mut() {
                 t.blocks.push(x.clone());
@@ -207,15 +235,22 @@ impl Decoder {
     fn embedding_row(&self, id: usize, out: &mut [f32]) {
         let d = self.d_model;
         match &self.embedding {
-            Weight::F32(w) => out.copy_from_slice(&w[id * d..(id + 1) * d]),
-            Weight::Q8(blocks) => expand(&blocks[id * d / 32..(id + 1) * d / 32], out),
+            Embedding::Int8(m) => m.row(id, out),
+            Embedding::Exact(Weight::F32(w)) => out.copy_from_slice(&w[id * d..(id + 1) * d]),
+            Embedding::Exact(Weight::Q8(blocks)) => {
+                expand(&blocks[id * d / 32..(id + 1) * d / 32], out)
+            }
         }
     }
 
     /// The tied output head: each row of `x` against every token's embedding.
     fn head(&self, x: &Mat) -> Mat {
+        let embedding = match &self.embedding {
+            Embedding::Int8(m) => return m.product(&quantize(x), None),
+            Embedding::Exact(w) => w,
+        };
         let rounded;
-        let x = if super::ops::ggml_rounding() && matches!(self.embedding, Weight::Q8(_)) {
+        let x = if super::ops::ggml_rounding() && matches!(embedding, Weight::Q8(_)) {
             rounded = super::ops::to_q8(x);
             &rounded
         } else {
@@ -229,7 +264,7 @@ impl Decoder {
             .map(|task| {
                 let range = task * VOCAB_PER_TASK..((task + 1) * VOCAB_PER_TASK).min(self.vocab);
                 let mut block = vec![0f32; x.rows * range.len()];
-                let rows: Rows = self.embedding.rows(range, d);
+                let rows: Rows = embedding.rows(range, d);
                 products(&inputs, rows, d, &mut block);
                 block
             })
@@ -245,4 +280,12 @@ impl Decoder {
         }
         out
     }
+}
+
+/// Whether the decoder takes the int8 products: only when `VELLUM_CPU_GEMM=int8` asks. A step
+/// streams the weights once for a few rows, which the f32 path already reads as Q8_0, so int8
+/// buys little there, and the exact decoder kept the transcripts closer to the reference's
+/// (Small, quick tier: 546 identical against 542).
+fn int8_decoder() -> bool {
+    int8_unless_told(false)
 }
